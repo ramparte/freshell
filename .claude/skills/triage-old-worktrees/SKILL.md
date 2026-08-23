@@ -1,7 +1,4 @@
----
-name: triage-old-worktrees
-description: "Use when auditing stale worktrees in Freshell to determine which contain novel unmerged work, which should be landed, which need finishing, and which can be safely deleted."
----
+# Skill: triage-old-worktrees
 
 # Triage Old Worktrees
 
@@ -11,175 +8,231 @@ Use this skill when the repo has accumulated worktrees in `.worktrees/` whose br
 
 ## Prerequisites
 
-- `origin/main` is the integration branch (Freshell policy)
-- Merge-commit PR workflow — branch tips become ancestors of `origin/main` when merged
-- Worktree branches start from `origin/main` and target PRs to `main`
+- `origin/main` is the integration branch.
+- Worktree branches start from `origin/main` and target PRs to `main`.
+- **Do NOT assume merge-commit-only PR workflow.** Real repos mix merge commits and squash merges. A squash-merged branch tip is NEVER an ancestor of `origin/main`, so ancestor checks alone produce false "unmerged" results (observed: 5+ fully-landed branches flagged as distinct in one audit). Use the layered merged-detection in Step 1.
+- `git cherry` (patch-id equivalence) does NOT detect squash merges — squashing combines commits, so patch-ids change. Do not rely on it.
 
 ## Process Overview
 
 ```
-01-baseline     → Establish safe-to-ignore criteria & filter worktrees
-02-first-pass   → One subagent scans all candidate worktrees for novel work
-03-second-pass  → Parallel deep-dive subagents for meaningful worktrees
-04-aggregate    → Produce final report (md + csv + html) with verdicts
+01-baseline     → scripts/collect-baseline.sh gathers per-worktree git metrics
+02-first-pass   → one subagent scans all candidate worktrees for novel work
+03-second-pass  → parallel deep-dive subagents for meaningful worktrees
+04-aggregate    → verdicts.jsonl + scripts/aggregate.py → final-report.{md,csv,html}
 ```
 
-Each step produces files in the analysis worktree. The final output drives deletion decisions and work-to-land prioritization.
+All outputs live under `.worktrees/<analysis-wt>/triage-output/` (a single subdirectory keeps the analysis worktree clean and the report set trivially committable).
+
+Create the analysis worktree from `origin/main` first, e.g.:
+
+```
+git worktree add .worktrees/worktree-triage-YYYYMMDD -b triage/worktrees-YYYYMMDD origin/main
+```
 
 ---
 
-## Step 1: Establish Baseline Criteria
+## Step 1: Baseline Metrics & Criteria
 
-Deploy a subagent to review the codebase and worktree inventory (`.worktrees/branch-inventory.json` if it exists) and establish criteria for "safe to ignore."
+Run the collected-metrics script (read-only, safe to re-run):
 
-### Criteria Categories
-
-**Category A — Auto-Skip / Safe to Delete (no deep dive needed):**
-- HEAD is ancestor of `origin/main` AND working tree is clean AND branch has 0 ahead commits
-- Plan-only or doc-only branches (`plan/*`, `docs/*`, `proof-*`)
-- Trivial changes (< 5 lines, config-only, test-reorder-only)
-- Branches already recorded as superseded in `branch-inventory.json`
-
-**Category B — First-Pass Only (quick inspection):**
-- ANCESTOR=YES + dirty working tree (check `git diff` for lost work)
-- ANCESTOR=NO + stale trivial branch (1-5 ahead, 100+ behind `origin/main`)
-- ANCESTOR=NO + trivial naming pattern (`plan/*`, `docs/*`, `proof-*`, `port/*`, `debug/*`, `test/*`, `chore/*`) AND ahead <= 20
-
-**Category C — Deep-Dive Required:**
-- ANCESTOR=NO + ahead > 5
-- ANCESTOR=NO + behind == 0 (truly novel, no mainline catch-up)
-- Any `feat/*`, `fix/*`, `codex/*`, `freshagent-*`, `freshcodex-*`, `freshopencode-*`, `opencode-*`, `rollback/*` branches
-- Dirty working tree on any meaningful branch
-
-### Baseline Data to Gather
-
-For each worktree in scope:
 ```
-git -C .worktrees/<name> rev-parse HEAD
-git merge-base --is-ancestor <HEAD> origin/main           # YES/NO
-git -C .worktrees/<name> symbolic-ref --short HEAD        # branch name
-git -C .worktrees/<name> log -1 --format=%ci              # last commit date
-git rev-list --count origin/main..<branch>                 # ahead count
-git rev-list --count <branch>..origin/main                 # behind count
-git -C .worktrees/<name> status --porcelain               # working tree check
+bash <skill-dir>/scripts/collect-baseline.sh .worktrees/<analysis-wt>/triage-output origin/main
 ```
 
-Filter to the desired time window (e.g., `past 4 weeks` = `date > "2026-05-23"`).
+This writes `triage-output/baseline-data.jsonl`, one JSON record per worktree.
+The collector skips the main checkout, the analysis worktree itself, and
+hidden/dot-prefixed worktree names (transient scratch like `.base-gate-$$`).
+Fields:
 
-Write baseline criteria to `.worktrees/<analysis-wt>/baseline-criteria.md`.
+```
+name, path, branch ("DETACHED" if detached), head, date (last commit),
+ancestor (YES/NO vs main), ahead, behind,
+dirty (status --porcelain line count), dirtySample,
+footprintFiles (files the branch touched since merge-base),
+footprintDiffersVsMain (of those, how many differ between branch tip
+                        and the current main tree)
+```
+
+### Merged-detection ladder (apply in order)
+
+1. `ancestor=YES` → merged. (For detached HEADs this is the common landed shape.)
+2. `ancestor=NO, footprintFiles>0, footprintDiffersVsMain==0` → contents match main exactly on the branch's own footprint → landed via squash/re-play. Confirm by the first pass reading the residual anyway (cheap).
+3. `ancestor=NO, footprintDiffersVsMain` small (≤3) → "near-landed": the residual diff is either post-merge forward evolution or a tiny unmerged residue. First pass must READ that diff and judge.
+4. Otherwise → clearly distinct work.
+
+Never classify merged-ness from ancestor status alone whenever the repo uses squash merges.
+
+### Triage categories
+
+**Category A — Auto-skip / safe to delete after dirty-check:**
+- ancestor=YES AND clean tree.
+- ancestor=YES AND dirty → still lands here, but the dirty files must be inspected (see below) — uncommitted work in a merged worktree is the #1 silent-loss risk in this whole procedure. Untracked agent litter (`.the-usual-*`, `.claude/`, `node_modules`, regenerated gate artifacts) does not count as real work.
+- Detached HEAD + ancestor + clean.
+
+**Category B — First-pass only (quick inspection):**
+- Near-landed (footprintDiffersVsMain ≤3).
+- Doc/plan-only namespaces **as derived from the actual data** (see below).
+
+**Category C — Deep-dive required:**
+- Clearly distinct work.
+- Any worktree whose uncommitted (dirty) content is judged real.
+
+### Derive branch namespaces from the repo — do not use fixed lists
+
+Don't hardcode "plan-like" prefixes (`plan/*`, `docs/*`, `proof-*`…) — they silently misclassify in real repos. Example observed failure: `the-usual/*` branches are real automation *work products* (not plans), while `docs/*`, `investigation/*`, `release/*`, `build/*`, plus campaign namespaces like `df1/gate-*`, were the actual doc/meta ones. Build the namespace → category map from the first-pass evidence (what the commits actually touch), and state it explicitly in `baseline-criteria.md`.
+
+### Scope & time window
+
+Default scope = **ALL worktrees in `.worktrees/`** (if they're being triaged, they're stale by definition). Only filter by date if the user asks for it.
+
+### Output
+
+Write `triage-output/baseline-criteria.md`: the merged-detection ladder, the measured bucket distribution (ancestor/near-landed/distinct/dirty counts), the derived namespace map, and the verdict vocabulary (below).
 
 ---
 
 ## Step 2: First Pass — Novel Work Detection
 
-Deploy **one fresh (no-context) subagent** to run the process over all worktrees in scope. For each worktree, it determines whether the worktree contains novel work not landed on `origin/main`.
+Deploy **one fresh (no-context) subagent** to scan all worktrees in scope. Hand it `baseline-data.jsonl` + `baseline-criteria.md`; its job is the qualitative pass.
 
-### Checks Per Worktree
+### Checks per worktree
 
 ```bash
-git -C .worktrees/<name> merge-base --is-ancestor HEAD origin/main
-git -C .worktrees/<name> status --porcelain
-git -C .worktrees/<name> log --oneline origin/main..HEAD        # unmerged commits
-git -C .worktrees/<name> diff --stat origin/main...HEAD          # change scope
+git -C <path> log --oneline origin/main..HEAD | head -8   # what is this
+git -C <path> status --porcelain                           # if dirty>0
+git -C <path> diff --stat                                  # if tracked dirty
+# near-landed: read the residual diff on the branch's own footprint
+git diff <HEAD> origin/main -- $(git diff --name-only $(git merge-base origin/main <HEAD>)..<HEAD>)
 ```
+
+Judge per worktree: **meaningful?** (unmerged or uncommitted work that might matter) and a 3–8 word summary from commit subjects.
 
 ### Output
 
-- `first-pass-table.md` — one-line-per-worktree table with columns: worktree, branch, date, ancestor?, status, commits, files Δ, meaningful?, summary
-- `worktrees-to-deep-dive.txt` — list of worktrees needing second pass
-- Skip plan-only worktrees and trivial (< 5 line) changes from deep dive
+- `triage-output/first-pass-table.md` — one row per worktree: worktree | branch | date | ancestor? | status | commits ahead | files Δ | meaningful? | summary.
+- `triage-output/worktrees-to-deep-dive.txt` — one worktree name per line: all clearly-distinct worktrees, near-landed ones with real residue, and merged-but-dirty ones with real uncommitted work.
+
+Contract for the subagent's return message: counts, the deep-dive list, ≤5 surprises, any errors — under 400 words. Full tables go in the files, not the message.
 
 ---
 
 ## Step 3: Second Pass — Deep Evaluation
 
-Deploy **multiple fresh subagents in parallel**, grouped by topic area (3-4 worktrees per subagent). Each subagent dives deep on its assigned worktrees and produces a verdict.
+Deploy **multiple fresh subagents in parallel**, grouped by topic area (3–4 worktrees per subagent). Derive groups from the first-pass summaries so each subagent's worktrees share a domain (e.g. UI polish, session restore, campaigns, infra).
 
-### Verdict Categories
+### Verdict categories
 
-1. **Ready for landing** — work is done, never landed, seems useful. After thorough static analysis, code review, and optional test runs, the work is complete and worthwhile.
+1. **ready-landing** — done, useful, never landed.
+2. **finish-work** — significant useful progress, incomplete.
+3. **throw-away-useless** — dead end / mistake / superseded.
+4. **in-main** — functionality already on `origin/main` (possibly squash-merged).
 
-2. **Finish work** — significant progress towards something useful, but still has bugs, open questions, or integration gaps.
+Plus metadata: `confidence` (high|medium|low) and `land-effort` (none|tiny|small|medium|large — effort to land any remaining value).
 
-3. **Throw away — useless** — superseded by different work, the user/session history made clear this was a mistake or dead end.
+### Deep-dive checks
 
-4. **Throw away — in main already** — the same functionality already landed on `origin/main`, possibly via a different implementation.
+1. **Git analysis:** `log origin/main..HEAD`, `diff --stat $(merge-base)..HEAD`.
+2. **In-main check:** footprint diff vs main (squash-landed?) + grep origin/main for distinctive identifiers + `git log origin/main --oneline --grep=<keywords>`.
+3. **Supersession check:** does current main implement the same capability differently and newer?
+4. **Bug-still-exists check:** read current main code for the scenario the branch addresses.
+5. **Uncommitted-work check:** if dirty, read the actual dirty diff — never trust `status` line counts. Judge salvage value. Flag "do not delete until archived/committed" loudly when real.
+6. **Tests (optional, only when verdict-changing):** check for `node_modules` in the worktree FIRST — stale worktrees often lack it; do not install dependencies. Run only focused patterns (`npm run test:vitest -- run <pattern>`, or the repo's equivalent); never broad suites; never use the shared test coordinator's broad gates from a triage deep dive.
+7. **Anti-poison check:** explicitly call out any file that must never be committed (deliberate red-proof mutations, temp diagnostics) and any branch that is the *only copy* of its work (unpushed).
+8. Look for context on main since the branch point — the branch's topic area may have been heavily reworked (check recent merge/squash subjects).
+9. **Never defer the verdict to the user.** If in doubt, dig more.
 
-### Deep-Dive Checks
+### Output contract
 
-For each worktree, the subagent should:
+Each subagent writes ONE report at `triage-output/deep-dive/NN-<topic>.md`. Per worktree, a section starting with a strict front-matter block (the aggregator depends on this shape):
 
-1. **Git analysis:** `log origin/main..HEAD`, `diff origin/main...HEAD`, `diff origin/main...HEAD --stat`
-2. **Check if on main already:** `git merge-base --is-ancestor`, grep for key identifiers in `origin/main`, compare blob hashes
-3. **Check for superseding work:** search `origin/main` for related keywords and implementer commits
-4. **Run relevant tests:** `npm run test:vitest -- run <test-pattern>` to verify the work still works
-5. **Check if the bug still exists:** read current code on main to see if the bug scenario is still present
-6. **Look for context:** check `~/.claude/projects/freshell/sessions/`, `~/.codex/`, `~/.config/opencode/` for session history
-7. **If in doubt:** deploy a fresh subagent to render the verdict. Never defer to the user.
+```yaml
+worktree: <name>
+branch: <branch>
+date: <last-commit-date>
+ahead: <n>
+behind: <n>
+verdict: <ready-landing | finish-work | throw-away-useless | in-main>
+confidence: <high|medium|low>
+land-effort: <none|tiny|small|medium|large>
+```
 
-### Topic Grouping
+then an Evidence section (cited commits/diffs/grep results/file paths — evidence over vibes) and a Recommendation (2–5 sentences).
 
-Group worktrees by topic to minimize context switching within a subagent:
-- OpenCode/freshopencode/freshcodex
-- Fresh agent UI
-- Terminal/catchup/replay
-- Settings/electron/codex
-- Tab status / reliability
-
-Each deep-dive report goes to `.worktrees/<analysis-wt>/deep-dive/<NN>-<topic>.md`.
+Return message: one line per worktree (`name: verdict (confidence) — reason`), ≤3 surprises, under 250 words.
 
 ---
 
 ## Step 4: Aggregate Final Report
 
-Deploy one subagent to read all deep-dive reports, baseline criteria, and first-pass table, then produce three files:
+Do this step **deterministically — not by subagent**. (Observed failure: an aggregation subagent returned empty output and died on resume; the output contract is fully mechanical, so code beats an agent here and is re-runnable after any adjustment.)
 
-### `final-report.md`
-- Executive summary with verdict counts
-- Section per verdict category (Ready for Landing, Finish Work, In Main Already, Skipped)
-- Each worktree listed with: name, branch, date, verdict, evidence summary, recommendation narrative
-- Full reference table sorted by recency
+1. The orchestrator (you) reads all `deep-dive/*.md` files and authors `triage-output/verdicts.jsonl` — one JSON object per line:
 
-### `final-report.csv`
-- Columns: `num,worktree,branch,date,verdict,category,analysis`
-- One row per audited worktree
-- Categories: `ready-landing`, `finish-work`, `in-main`, `skipped-plan`, `skipped-trivial`
+```json
+{"name": "...", "verdict": "finish-work", "confidence": "high", "land_effort": "small", "analysis": "1-2 sentence evidence summary", "deepdive": "deep-dive/03-campaigns.md"}
+```
 
-### `final-report.html`
-- Standalone, self-contained HTML (no external dependencies)
-- Color-coded cards per verdict: green=ready-landing, yellow=finish-work, gray=in-main, light-gray=skipped
-- Summary cards with counts
-- Sortable/filterable table
-- Links to deep-dive report files (relative paths)
+Condense each deep-dive's Evidence/Recommendation into `analysis`. Also add entries for any non-deep-dived worktrees that deserve better than the automatic derivation (e.g. plan branches whose plans have standalone value — flag as kata candidates in `analysis`). `deepdive` is optional; omit it for derived rows.
+
+2. Run:
+
+```
+python3 <skill-dir>/scripts/aggregate.py .worktrees/<analysis-wt>/triage-output origin/main
+```
+
+It validates that every worktree in `worktrees-to-deep-dive.txt` has a verdict, writes `final-report.csv` (74-column-safe CSV, one row per baseline record) and `final-report.html` (self-contained, sortable/filterable, verdict-filter buttons, color-coded, links into `deep-dive/`), and prints verdict counts. Cross-check the printed counts against the first-pass table totals.
+
+3. Hand-author (or delegate, but then VERIFY the file exists and is non-empty) `triage-output/final-report.md`: executive summary with verdict counts, one section per action priority (ready-landing → finish-work → in-main → throw-away → skipped), per-item narratives for the first two sections, a full reference table pointer, and a numbered "recommended next actions" list. Include a Cautions subsection listing anything destructive-yet-tempting (poison files, unpushed only-copies, uncommitted WIP).
+
+4. Verify the HTML renders (open it, check row count + a filter click). Then commit the whole `triage-output/` tree on the analysis branch.
+
+### `final-report.csv` columns
+
+`num,worktree,branch,date,verdict,confidence,land_effort,category,analysis`
+
+Categories: `ready-landing`, `finish-work`, `in-main`, `throw-away`, `skipped-plan`, `skipped-trivial`.
 
 ---
 
 ## Expected Outcomes
 
-After completing all steps, the analysis worktree contains:
-
 ```
-.worktrees/<analysis-wt>/
+.worktrees/<analysis-wt>/triage-output/
 ├── baseline-criteria.md
+├── baseline-data.jsonl
 ├── first-pass-table.md
 ├── worktrees-to-deep-dive.txt
 ├── deep-dive/
 │   ├── 01-<topic>.md
-│   ├── 02-<topic>.md
 │   └── ...
+├── verdicts.jsonl
 ├── final-report.md
 ├── final-report.csv
 └── final-report.html
 ```
 
 The final report tells you:
-- Which worktrees to delete (already merged / skipped)
-- Which worktrees to land (ready for landing)
-- Which worktrees need finishing (what's incomplete, what's blocking)
-- Which are the highest priority (the "0 behind main" worktrees with novel commits)
+- Which worktrees are deletable (in-main / throw-away / skipped)
+- Which to land (ready-landing)
+- Which need finishing and what's blocking (finish-work)
+- Which contain uncommitted or unpushed work that deletion would silently destroy (the real point of the exercise)
 
-## After the Audit
+## After the Audit — approval gates
 
-1. Delete worktrees in "already in main" and "skipped" categories
-2. Create PRs for "ready for landing" branches
-3. For "finish work" branches, file katas describing the problem, referencing the worktree and assessment
+Deletions destroy uncommitted/unpushed work by design; PRs and katas mutate the shared repo state. Therefore, per repo policy, present the report and get explicit user approval before acting. Then, in priority order:
+
+1. **Protect loss-risk items first:** commit/extract uncommitted WIP; push unpushed only-copies as archive branches; land salvageable untracked files (tests, docs) via normal PRs.
+2. Delete worktrees in `in-main` / `throw-away` / `skipped` (only after step 1 clears their cautions).
+3. Create PRs for `ready-landing` branches (after the repo's normal broad gate).
+4. File katas for `finish-work` items, referencing worktree paths + deep-dive assessments.
+
+## Pitfalls (observed)
+
+- **Squash merges defeat ancestor checks.** Use the footprint ladder, always.
+- **Uncommitted work is where the bodies are buried.** A "merged" worktree can hold the most valuable uncommitted diagnostics in the repo. Always read dirty diffs.
+- **A branch can add nothing to git history and still look busy** — e.g. a fix that was merged, then reverted, leaves the worktree byte-identical to a reverted PR. Compare against the merged-and-reverted possibility explicitly.
+- **"Partially landed" is usually post-merge forward evolution**, not residue — read the actual residual diff before flagging.
+- **Only-copy branches** (unpushed) must be called out before any deletion list is acted on.
+- **Verify subagent artifacts exist.** An agent claiming completion proves nothing; check the files.
+- Keep every subagent's return message small; artifacts carry the detail.
