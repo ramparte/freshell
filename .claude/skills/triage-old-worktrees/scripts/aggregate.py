@@ -31,6 +31,7 @@ from pathlib import Path
 
 VERDICTS = ('ready-landing', 'finish-work', 'in-main', 'throw-away-useless',
             'skipped-plan', 'skipped-trivial')
+DIRTS = ('none', 'read-useful', 'read-litter', 'unread')
 VERDICT_TO_CATEGORY = {'ready-landing': 'ready-landing', 'finish-work': 'finish-work',
                        'in-main': 'in-main', 'throw-away-useless': 'throw-away',
                        'skipped-plan': 'skipped-plan', 'skipped-trivial': 'skipped-trivial'}
@@ -77,14 +78,36 @@ def main() -> int:
         print(f'ERROR: deep-dived worktrees missing from verdicts.jsonl: {missing}', file=sys.stderr)
         return 1
 
+    # Hard rule: dirty worktrees need an explicit verdicts entry with a dirt
+    # field — dirt is never auto-derived, because "litter" requires a read.
+    dirt_warnings = []
+    for name, r in recs.items():
+        if isinstance(r.get('dirty'), int) and r['dirty'] > 0:
+            v = verdicts.get(name)
+            if v is None:
+                dirt_warnings.append(f'{name}: dirty={r["dirty"]} but no verdicts.jsonl entry')
+            elif v.get('dirt') in (None, 'unread'):
+                dirt_warnings.append(f'{name}: dirty={r["dirty"]} but dirt is missing/unread in verdicts.jsonl')
+
+    def dirt_of(name, r, v):
+        if not isinstance(r.get('dirty'), int) or r['dirty'] == 0:
+            return 'none', []
+        if v is None:
+            return 'unread', []
+        d = v.get('dirt', 'unread')
+        assert d in DIRTS, f"bad dirt {d} for {name}"
+        return d, list(v.get('useful_dirt_files', []))
+
     rows = []
     for name, r in recs.items():
         if name in verdicts:
             v = verdicts[name]
+            dv, dfiles = dirt_of(name, r, v)
             rows.append({'name': name, 'branch': r['branch'], 'date': r['date'],
                          'verdict': v['verdict'], 'confidence': v.get('confidence', 'medium'),
                          'land_effort': v.get('land_effort', 'none'),
                          'category': VERDICT_TO_CATEGORY[v['verdict']],
+                         'dirt': dv, 'useful_dirt_files': dfiles,
                          'analysis': v['analysis'], 'deepdive': v.get('deepdive', ''),
                          'ahead': r['ahead'], 'behind': r['behind'], 'dirty': r['dirty']})
             continue
@@ -105,22 +128,31 @@ def main() -> int:
             verdict, conf, eff = ('skipped-plan' if planish else 'skipped-trivial'), 'medium', 'none'
             analysis = (fp_summary.get(name, '') + ' [' + fp_status.get(name, '') + ']').strip()
             link = ''
+        dv, dfiles = dirt_of(name, r, verdicts.get(name))
         rows.append({'name': name, 'branch': r['branch'], 'date': r['date'], 'verdict': verdict,
                      'confidence': conf, 'land_effort': eff, 'category': VERDICT_TO_CATEGORY[verdict],
+                     'dirt': dv, 'useful_dirt_files': dfiles,
                      'analysis': analysis, 'deepdive': link,
                      'ahead': r['ahead'], 'behind': r['behind'], 'dirty': r['dirty']})
 
     rows.sort(key=lambda x: x['date'], reverse=True)
     from collections import Counter
     print('verdict counts:', dict(Counter(r['verdict'] for r in rows)))
+    dirt_counts = Counter(r['dirt'] for r in rows)
+    print('dirt counts:', dict(dirt_counts))
+    if dirt_warnings:
+        print('WARNING (dirt blocks deletion-safety):', file=sys.stderr)
+        for w in dirt_warnings:
+            print('  - ' + w, file=sys.stderr)
 
     with open(out / 'final-report.csv', 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['num', 'worktree', 'branch', 'date', 'verdict', 'confidence',
-                    'land_effort', 'category', 'analysis'])
+                    'land_effort', 'category', 'dirt', 'analysis'])
         for i, r in enumerate(rows, 1):
+            useful = (' [useful dirt: ' + '; '.join(r['useful_dirt_files']) + ']') if r['useful_dirt_files'] else ''
             w.writerow([i, r['name'], r['branch'], r['date'], r['verdict'], r['confidence'],
-                        r['land_effort'], r['category'], r['analysis']])
+                        r['land_effort'], r['category'], r['dirt'], r['analysis'] + useful])
 
     # HTML ------------------------------------------------------------------
     repo_root = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
@@ -134,18 +166,28 @@ def main() -> int:
     trs = []
     for i, r in enumerate(rows, 1):
         dd = f' · <a href="{html.escape(r["deepdive"])}">deep dive</a>' if r['deepdive'] else ''
+        dfiles = (f'<div class="dfiles">useful: {html.escape("; ".join(r["useful_dirt_files"]))}</div>'
+                  if r['useful_dirt_files'] else '')
         trs.append(
             f'<tr data-verdict="{r["verdict"]}"><td class="num">{i}</td>'
             f'<td class="mono">{html.escape(r["name"])}</td>'
             f'<td class="mono sm">{html.escape(r["branch"])}</td><td>{r["date"]}</td>'
             f'<td><span class="pill" style="background:{COLOR[r["verdict"]]}">{r["verdict"]}</span></td>'
             f'<td>{r["confidence"]}</td><td>{r["land_effort"]}</td>'
+            f'<td class="dirt-{r["dirt"]}">{r["dirt"]}{dfiles}</td>'
             f'<td class="num">{r["ahead"]}</td><td class="num">{r["behind"]}</td>'
             f'<td class="num">{r["dirty"]}</td><td>{html.escape(r["analysis"])}{dd}</td></tr>')
 
+    banner = ''
+    n_unread = sum(1 for r in rows if r['dirt'] == 'unread')
+    if n_unread:
+        banner = (f'<div class="banner">⚠ {n_unread} worktree(s) have '
+                  f'<b>unread dirt</b> — not deletion-safe until every dirty file has been read '
+                  f'(see dirt-report).</div>')
+
     html_doc = HTPL.replace('__CARDS__', cards).replace('__TRS__', ''.join(trs)) \
         .replace('__DATA__', json.dumps(rows)).replace('__LABELS__', json.dumps(LABEL)) \
-        .replace('__COLORS__', json.dumps(COLOR)) \
+        .replace('__COLORS__', json.dumps(COLOR)).replace('__BANNER__', banner) \
         .replace('__TITLE__', f'Worktree triage - {date.today().isoformat()}') \
         .replace('__META__', html.escape(
             f'repo: {repo_root} · main: {main_ref} @ {main_sha} · {len(rows)} worktrees audited · '
@@ -178,6 +220,11 @@ HTPL = '''<!DOCTYPE html>
  tr:hover td { background: #f8fafc; }
  .pill { color: #fff; border-radius: 999px; padding: .1rem .55rem; font-size: .75rem; white-space: nowrap; }
  tr[data-verdict="skipped-plan"] .pill, tr[data-verdict="skipped-trivial"] .pill { color: #334155; }
+ .dirt-none { color: #94a3b8; } .dirt-read-litter { color: #64748b; }
+ .dirt-read-useful { color: #15803d; font-weight: 600; }
+ .dirt-unread { color: #b45309; font-weight: 700; }
+ .dfiles { font-size: .72rem; color: #15803d; font-weight: 400; margin-top: .15rem; }
+ .banner { background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: .6rem .9rem; margin-bottom: 1rem; font-size: .9rem; }
  .mono { font-family: ui-monospace, monospace; font-size: .78rem; } .sm { font-size: .72rem; color: #475569; }
  .num { text-align: right; }
 </style>
@@ -186,6 +233,7 @@ HTPL = '''<!DOCTYPE html>
 <h1>__TITLE__</h1>
 <div class="meta">__META__</div>
 <div class="cards">__CARDS__</div>
+__BANNER__
 <div class="controls">
  <label for="q">Filter: <input type="search" id="q" placeholder="worktree, branch, analysis&hellip;"></label>
  <span id="vfilters"></span>
@@ -195,7 +243,8 @@ HTPL = '''<!DOCTYPE html>
 <th data-k="num"># <span class="arrow"></span></th><th data-k="name">worktree <span class="arrow"></span></th>
 <th data-k="branch">branch <span class="arrow"></span></th><th data-k="date">date <span class="arrow"></span></th>
 <th data-k="verdict">verdict <span class="arrow"></span></th><th data-k="confidence">confidence <span class="arrow"></span></th>
-<th data-k="land_effort">land effort <span class="arrow"></span></th><th data-k="ahead">ahead <span class="arrow"></span></th>
+<th data-k="land_effort">land effort <span class="arrow"></span></th><th data-k="dirt">dirt <span class="arrow"></span></th>
+<th data-k="ahead">ahead <span class="arrow"></span></th>
 <th data-k="behind">behind <span class="arrow"></span></th><th data-k="dirty">dirty <span class="arrow"></span></th>
 <th data-k="analysis">analysis <span class="arrow"></span></th>
 </tr></thead>
@@ -231,9 +280,11 @@ function render() {
     const dd = d.deepdive ? ' &middot; <a href="' + d.deepdive + '">deep dive</a>' : '';
     const c = COLORS[d.verdict];
     const dark = d.verdict.startsWith('skipped') ? ' style="background:'+c+';color:#334155"' : ' style="background:'+c+'"';
+    const df = (d.useful_dirt_files && d.useful_dirt_files.length)
+      ? '<div class="dfiles">useful: ' + esc(d.useful_dirt_files.join('; ')) + '</div>' : '';
     return '<tr><td class="num">'+(i+1)+'</td><td class="mono">'+esc(d.name)+'</td><td class="mono sm">'+esc(d.branch)+'</td><td>'+d.date+
       '</td><td><span class="pill"'+dark+'>'+d.verdict+'</span></td><td>'+d.confidence+'</td><td>'+d.land_effort+
-      '</td><td class="num">'+d.ahead+'</td><td class="num">'+d.behind+'</td><td class="num">'+d.dirty+'</td><td>'+esc(d.analysis)+dd+'</td></tr>';
+      '</td><td class="dirt-'+d.dirt+'">'+d.dirt+df+'</td><td class="num">'+d.ahead+'</td><td class="num">'+d.behind+'</td><td class="num">'+d.dirty+'</td><td>'+esc(d.analysis)+dd+'</td></tr>';
   }).join('');
 }
 function esc(s){ const e = document.createElement('span'); e.textContent = s; return e.innerHTML; }

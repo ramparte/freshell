@@ -67,7 +67,7 @@ Never classify merged-ness from ancestor status alone whenever the repo uses squ
 
 **Category A — Auto-skip / safe to delete after dirty-check:**
 - ancestor=YES AND clean tree.
-- ancestor=YES AND dirty → still lands here, but the dirty files must be inspected (see below) — uncommitted work in a merged worktree is the #1 silent-loss risk in this whole procedure. Untracked agent litter (`.the-usual-*`, `.claude/`, `node_modules`, regenerated gate artifacts) does not count as real work.
+- ancestor=YES AND dirty → NOT auto-skip until every dirty file has been **read** (see "Dirt is not litter until read"). Uncommitted work in a merged worktree is the #1 silent-loss risk in this whole procedure. Untracked agent litter (`.the-usual-*`, `.claude/`, `node_modules`, regenerated gate artifacts) does not count as real work — but you may only call it litter *after reading it*, not by name.
 - Detached HEAD + ancestor + clean.
 
 **Category B — First-pass only (quick inspection):**
@@ -76,7 +76,38 @@ Never classify merged-ness from ancestor status alone whenever the repo uses squ
 
 **Category C — Deep-dive required:**
 - Clearly distinct work.
-- Any worktree whose uncommitted (dirty) content is judged real.
+- Any worktree whose uncommitted (dirty) content is judged real — and "judged real or junk" requires reading, see below.
+
+### Dirt is not litter until read (hard rule)
+
+A dirty working tree is an open question, not an answer. No file may be
+classified as litter, regenerable, or "not worth keeping" from its name, path,
+extension, or `status --porcelain` line alone. Every dirty file must be OPENED
+and its content actually read — code: read it; data/logs/artifacts: substantively
+reviewed (head, structure, provenance). Only then is it recorded.
+
+Consequences:
+
+- A worktree with `dirty > 0` can never be classified `in-main`, `skipped-*`,
+  or deletion-safe on ancestor status or commit analysis alone. Its dirt must
+  reach `read-litter` or `read-useful` before it gets a deletion-safe verdict —
+  `dirt=unread` blocks deletion.
+- If a "merged" worktree's unread dirt later proves useful, the verdict was
+  wrong, not the dirt.
+- Useful dirt in a deletion candidate is archived FIRST (copy into the analysis
+  worktree's `triage-output/archive/<worktree>/` and commit, or commit it onto
+  its own branch) before any removal.
+
+The read evidence is a deliverable: `triage-output/dirt-report/NN-<scope>.md`
+per reading pass, merged into `triage-output/dirt-report.md`, one row per dirty
+file:
+
+```
+worktree | file | size | what it actually is (from reading it) | disposition
+```
+
+Dispositions: `commit-to-branch` / `extract-to-new-branch` / `land-via-PR` /
+`archive-in-triage` / `delete-as-litter` / `never-commit-poison`.
 
 ### Derive branch namespaces from the repo — do not use fixed lists
 
@@ -136,7 +167,7 @@ Plus metadata: `confidence` (high|medium|low) and `land-effort` (none|tiny|small
 2. **In-main check:** footprint diff vs main (squash-landed?) + grep origin/main for distinctive identifiers + `git log origin/main --oneline --grep=<keywords>`.
 3. **Supersession check:** does current main implement the same capability differently and newer?
 4. **Bug-still-exists check:** read current main code for the scenario the branch addresses.
-5. **Uncommitted-work check:** if dirty, read the actual dirty diff — never trust `status` line counts. Judge salvage value. Flag "do not delete until archived/committed" loudly when real.
+5. **Uncommitted-work check:** if dirty, READ the actual dirty diff/files (the hard rule above) — never trust `status` line counts or filenames. Judge salvage value from content. Flag "do not delete until archived/committed" loudly when real.
 6. **Tests (optional, only when verdict-changing):** check for `node_modules` in the worktree FIRST — stale worktrees often lack it; do not install dependencies. Run only focused patterns (`npm run test:vitest -- run <pattern>`, or the repo's equivalent); never broad suites; never use the shared test coordinator's broad gates from a triage deep dive.
 7. **Anti-poison check:** explicitly call out any file that must never be committed (deliberate red-proof mutations, temp diagnostics) and any branch that is the *only copy* of its work (unpushed).
 8. Look for context on main since the branch point — the branch's topic area may have been heavily reworked (check recent merge/squash subjects).
@@ -167,13 +198,19 @@ Return message: one line per worktree (`name: verdict (confidence) — reason`),
 
 Do this step **deterministically — not by subagent**. (Observed failure: an aggregation subagent returned empty output and died on resume; the output contract is fully mechanical, so code beats an agent here and is re-runnable after any adjustment.)
 
-1. The orchestrator (you) reads all `deep-dive/*.md` files and authors `triage-output/verdicts.jsonl` — one JSON object per line:
+1. The orchestrator (you) reads all `deep-dive/*.md` and `dirt-report.md` files and authors `triage-output/verdicts.jsonl` — one JSON object per line:
 
 ```json
-{"name": "...", "verdict": "finish-work", "confidence": "high", "land_effort": "small", "analysis": "1-2 sentence evidence summary", "deepdive": "deep-dive/03-campaigns.md"}
+{"name": "...", "verdict": "finish-work", "confidence": "high", "land_effort": "small", "analysis": "1-2 sentence evidence summary", "deepdive": "deep-dive/03-campaigns.md", "dirt": "read-useful", "useful_dirt_files": ["crates/…/adapter.rs"]}
 ```
 
 Condense each deep-dive's Evidence/Recommendation into `analysis`. Also add entries for any non-deep-dived worktrees that deserve better than the automatic derivation (e.g. plan branches whose plans have standalone value — flag as kata candidates in `analysis`). `deepdive` is optional; omit it for derived rows.
+
+**`dirt` field** (required vocabulary: `none` | `read-useful` | `read-litter` | `unread`):
+- Every worktree with baseline `dirty > 0` MUST have an explicit verdicts.jsonl entry with `dirt` set — the aggregator refuses to derive one.
+- `read-useful` entries SHOULD list the specific file paths in `useful_dirt_files`; the aggregator renders them in the report.
+- `read-litter` / `read-useful` are only valid after every dirty file has actually been read (the hard rule).
+- Clean worktrees may omit `dirt` (aggregator derives `none`).
 
 2. Run:
 
@@ -189,9 +226,9 @@ It validates that every worktree in `worktrees-to-deep-dive.txt` has a verdict, 
 
 ### `final-report.csv` columns
 
-`num,worktree,branch,date,verdict,confidence,land_effort,category,analysis`
+`num,worktree,branch,date,verdict,confidence,land_effort,category,dirt,analysis`
 
-Categories: `ready-landing`, `finish-work`, `in-main`, `throw-away`, `skipped-plan`, `skipped-trivial`.
+Categories: `ready-landing`, `finish-work`, `in-main`, `throw-away`, `skipped-plan`, `skipped-trivial`. Dirt: `none`, `read-useful`, `read-litter`, `unread` — rows with `unread` are not deletion-safe.
 
 ---
 
@@ -206,6 +243,8 @@ Categories: `ready-landing`, `finish-work`, `in-main`, `throw-away`, `skipped-pl
 ├── deep-dive/
 │   ├── 01-<topic>.md
 │   └── ...
+├── dirt-report.md          (plus dirt-report/NN-<scope>.md reading passes; only if any dirty>0)
+├── archive/                (only if useful dirt was salvaged from deletion candidates)
 ├── verdicts.jsonl
 ├── final-report.md
 ├── final-report.csv
@@ -230,7 +269,9 @@ Deletions destroy uncommitted/unpushed work by design; PRs and katas mutate the 
 ## Pitfalls (observed)
 
 - **Squash merges defeat ancestor checks.** Use the footprint ladder, always.
-- **Uncommitted work is where the bodies are buried.** A "merged" worktree can hold the most valuable uncommitted diagnostics in the repo. Always read dirty diffs.
+- **Uncommitted work is where the bodies are buried.** A "merged" worktree can hold the most valuable uncommitted diagnostics in the repo. Always read dirty diffs — observed near-miss: four unique unlanded plan docs nearly deleted with a "merged" worktree because the dirt was classified by filename (`docs/plans/*.md` "looks like litter").
+- **"Regenerable artifact" is a READ conclusion, not a filename pattern.** Two `gate01-baseline.json` files were deleted on name alone; they happened to be genuinely regenerable, but the process was below standard — nothing is litter until read.
+- **Guards at deletion time, not audit time.** Any worktree whose HEAD or dirty state changed since the audit must be re-verified; foreign agents mutate worktrees concurrently (observed: one worktree's `.git` pointer was removed mid-cleanup by another agent, making `git` commands inside it silently report the parent repo's state — always sanity-check that `git -C <wt> rev-parse --git-dir` points where you expect).
 - **A branch can add nothing to git history and still look busy** — e.g. a fix that was merged, then reverted, leaves the worktree byte-identical to a reverted PR. Compare against the merged-and-reverted possibility explicitly.
 - **"Partially landed" is usually post-merge forward evolution**, not residue — read the actual residual diff before flagging.
 - **Only-copy branches** (unpushed) must be called out before any deletion list is acted on.
