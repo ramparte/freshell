@@ -205,11 +205,19 @@ export type ExtensionPaneContent = {
   props: Record<string, unknown>
 }
 
+/** Read-only Freshell attachment to a Concern OS-owned tmux pane or ended session. */
+export type ExistingPaneContent = {
+  kind: 'existing-pane'
+  sessionId: string
+  title?: string
+  cwd?: string
+}
+
 /**
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent | ExistingPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -236,9 +244,10 @@ export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' 
  * Extension content needs no normalization — passes through unchanged.
  */
 export type ExtensionPaneInput = ExtensionPaneContent
+export type ExistingPaneInput = ExistingPaneContent
 
 export type LivePaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput | ExistingPaneInput
 
 export type LegacyPaneContentInput = Record<string, unknown>
 

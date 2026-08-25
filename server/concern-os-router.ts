@@ -1,0 +1,122 @@
+import { Router } from 'express'
+import type { ConcernOsClient } from './concern-os-client.js'
+import {
+  ExistingPaneAdapter,
+  ExistingPaneIdentityError,
+  ExistingPaneInputError,
+} from './existing-pane-adapter.js'
+import {
+  ConcernPaneInputRequestSchema,
+  MAX_CONCERN_PANE_INPUT_BYTES,
+  type ConcernSession,
+} from '../shared/concern-os-contract.js'
+
+function assertRequestedSession(
+  requestedSession: string,
+  session: ConcernSession,
+): ConcernSession {
+  const providerPrefix = 'amplifier:'
+  const expectedSessionId = requestedSession.startsWith(providerPrefix)
+    ? requestedSession.slice(providerPrefix.length)
+    : requestedSession
+  const expectedKey = `${providerPrefix}${expectedSessionId}`
+
+  if (
+    expectedSessionId.length === 0
+    || session.provider !== 'amplifier'
+    || session.session_id !== expectedSessionId
+    || session.id !== expectedKey
+  ) {
+    throw new ExistingPaneIdentityError('Concern OS returned a different session mapping.')
+  }
+  return session
+}
+
+async function getRequestedSession(
+  client: ConcernOsClient,
+  requestedSession: string,
+): Promise<ConcernSession> {
+  return assertRequestedSession(
+    requestedSession,
+    await client.getSession(requestedSession),
+  )
+}
+
+export function createConcernOsRouter(
+  client: ConcernOsClient,
+  paneAdapter: ExistingPaneAdapter = new ExistingPaneAdapter(),
+): Router {
+  const router = Router()
+
+  router.get('/concern-os/sessions', async (_req, res) => {
+    try {
+      res.json(await client.listSessions())
+    } catch (error) {
+      res.status(502).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Concern OS session catalog unavailable',
+      })
+    }
+  })
+
+  router.get('/concern-os/sessions/:sessionId/pane', async (req, res) => {
+    try {
+      const session = await getRequestedSession(client, req.params.sessionId)
+      res.json(await paneAdapter.capture(session))
+    } catch (error) {
+      const identityFailure = error instanceof ExistingPaneIdentityError
+      res.status(identityFailure ? 409 : 502).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Existing tmux pane unavailable',
+      })
+    }
+  })
+
+  router.post('/concern-os/sessions/:sessionId/pane/input', async (req, res) => {
+    const parsed = ConcernPaneInputRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ ok: false, error: 'Invalid existing-pane input request.' })
+      return
+    }
+    if (Buffer.byteLength(parsed.data.data, 'utf8') > MAX_CONCERN_PANE_INPUT_BYTES) {
+      res.status(413).json({
+        ok: false,
+        error: `Existing-pane input exceeds ${MAX_CONCERN_PANE_INPUT_BYTES} UTF-8 bytes.`,
+      })
+      return
+    }
+
+    try {
+      const initialSession = await getRequestedSession(client, req.params.sessionId)
+      res.json(await paneAdapter.sendInput(
+        initialSession,
+        parsed.data,
+        () => getRequestedSession(client, req.params.sessionId),
+      ))
+    } catch (error) {
+      const conflict = error instanceof ExistingPaneIdentityError
+        || error instanceof ExistingPaneInputError
+      res.status(conflict ? 409 : 502).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Existing tmux pane input failed',
+      })
+    }
+  })
+
+  router.get('/concern-os/sessions/:sessionId', async (req, res) => {
+    try {
+      res.json({
+        ok: true,
+        item: await getRequestedSession(client, req.params.sessionId),
+      })
+    } catch (error) {
+      const identityFailure = error instanceof ExistingPaneIdentityError
+      res.status(identityFailure ? 409 : 502).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Concern OS session unavailable',
+      })
+    }
+  })
+
+  return router
+}

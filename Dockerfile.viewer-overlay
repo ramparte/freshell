@@ -1,0 +1,15 @@
+FROM freshell-demo:0.7.5-arm64-viewer-safe
+
+# Existing-pane capture and input are mediated through the exact mounted host
+# tmux socket, but the viewer-safe base image does not include the tmux client.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tmux \
+    && rm -rf /var/lib/apt/lists/*
+USER 1000:1000
+
+# Preserve the validated base runtime while replacing the compiled Stage 1
+# integration surfaces. The server and shared contract must move together.
+COPY dist/server /app/dist/server
+COPY dist/shared /app/dist/shared
+COPY dist/client /app/dist/client

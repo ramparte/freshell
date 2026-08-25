@@ -76,6 +76,9 @@ import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { createHealthRouter } from './health-router.js'
+import { ConcernOsClient } from './concern-os-client.js'
+import { createConcernOsRouter } from './concern-os-router.js'
+import { assertGenericTerminalCreationAllowed } from './existing-panes-policy.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
 import { createClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
@@ -207,6 +210,8 @@ async function main() {
 
   app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
+  const concernOsClient = new ConcernOsClient()
+  app.use('/api', createConcernOsRouter(concernOsClient))
   // Shell bootstrap route: returns shell-critical first-paint data only
   app.use('/api', createShellBootstrapRouter({
     getSettings: async () => configStore.getSettings(),
@@ -417,6 +422,7 @@ async function main() {
   networkManager.setWsHandler(wsHandler)
   let terminalCreateAdmissionOpen = true
   const assertTerminalCreateAccepted = () => {
+    assertGenericTerminalCreationAllowed()
     if (!terminalCreateAdmissionOpen) {
       throw new Error('Server is shutting down; terminal creation is not accepted.')
     }

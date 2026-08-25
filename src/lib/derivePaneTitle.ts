@@ -39,6 +39,10 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
     return content.extensionName
   }
 
+  if (content.kind === 'existing-pane') {
+    return content.title || (content.cwd ? basenameSegment(content.cwd) : null) || 'Amplifier session'
+  }
+
   // Terminal content — coding-agent (non-shell) terminals name by working directory
   if (isNonShellMode(content.mode)) {
     const segment = content.initialCwd ? basenameSegment(content.initialCwd) : null

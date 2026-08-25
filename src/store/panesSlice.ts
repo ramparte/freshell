@@ -186,6 +186,14 @@ function normalizePaneContent(
   if (input.kind === 'extension') {
     return input  // Extension content passes through unchanged
   }
+  if (input.kind === 'existing-pane') {
+    return {
+      kind: 'existing-pane',
+      sessionId: input.sessionId,
+      title: input.title,
+      cwd: input.cwd,
+    }
+  }
   // Editor/picker content passes through unchanged
   return input
 }

@@ -6,6 +6,7 @@ import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
+import { ExistingPaneView } from '../ExistingPaneView'
 import BrowserPane from './BrowserPane'
 import FreshAgentView from '../fresh-agent/FreshAgentView'
 import ExtensionPane from './ExtensionPane'
@@ -456,6 +457,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       ? node.content.status
       : node.content.kind === 'fresh-agent'
         ? (node.content.status === 'exited' ? 'exited' : 'running')
+        : node.content.kind === 'existing-pane'
+          ? 'running'
         : 'running'
     const isRenaming = renamingPaneId === node.id
     const paneProvider: CodingCliProviderName | undefined =
@@ -562,7 +565,14 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRefresh={handleRefresh}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
-        {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
+        {renderContent(
+          tabId,
+          node.id,
+          node.content,
+          isOnlyPane,
+          hidden,
+          activePane === node.id,
+        )}
       </Pane>
     )
   }
@@ -833,6 +843,7 @@ function renderContent(
   content: PaneContent,
   isOnlyPane: boolean,
   hidden?: boolean,
+  focused = false,
 ) {
   if (content.kind === 'terminal') {
     return (
@@ -912,6 +923,20 @@ function renderContent(
     return (
       <ErrorBoundary key={paneId} label="Extension">
         <ExtensionPane tabId={tabId} paneId={paneId} content={content} />
+      </ErrorBoundary>
+    )
+  }
+
+  if (content.kind === 'existing-pane') {
+    return (
+      <ErrorBoundary key={`${paneId}:${content.sessionId}`} label="Existing tmux pane">
+        <ExistingPaneView
+          sessionId={content.sessionId}
+          title={content.title}
+          cwd={content.cwd}
+          hidden={hidden}
+          focused={focused && !hidden}
+        />
       </ErrorBoundary>
     )
   }

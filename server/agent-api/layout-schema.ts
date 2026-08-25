@@ -65,6 +65,12 @@ const RawPaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
         extensionName: z.string(),
         props: z.record(z.string(), z.any()),
       }).passthrough(),
+      z.object({
+        kind: z.literal('existing-pane'),
+        sessionId: z.string().min(1),
+        title: z.string().optional(),
+        cwd: z.string().optional(),
+      }).passthrough(),
       z.object({ kind: z.string() }).passthrough(),
     ]),
   }),

@@ -196,7 +196,8 @@ export const amplifierProvider: CodingCliProvider = {
         }
       }),
     )
-    return maxDefined(...mtimes)
+    const activityMtime = maxDefined(...mtimes)
+    return activityMtime === undefined ? undefined : Math.trunc(activityMtime)
   },
 
   async listSessionFiles() {

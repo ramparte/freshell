@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
-import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { openExistingPaneTab, openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
@@ -23,6 +23,9 @@ import { collectBusySessionKeys } from '@/lib/pane-activity'
 import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
+import { useConcernSessions } from '@/hooks/useConcernSessions'
+import { mergeConcernSessionItems, sortByConcernAttention } from '@/lib/concern-os-sessions'
+import type { ConcernSession } from '@shared/concern-os-contract'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
@@ -195,6 +198,7 @@ export default function Sidebar({
   width?: number
   fullWidth?: boolean
 }) {
+  const { bySessionId: concernSessions, error: concernSessionsError } = useConcernSessions()
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const settings = useAppSelector((s) => s.settings.settings)
@@ -308,7 +312,13 @@ export default function Sidebar({
   ])
 
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
-  const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
+  const computedItems = useMemo(
+    () => sortByConcernAttention(
+      mergeConcernSessionItems(localFilteredItems, concernSessions, localQuery),
+      concernSessions,
+    ),
+    [concernSessions, localFilteredItems, localQuery],
+  )
 
   // Stabilize the array reference so react-window doesn't rebuild all row
   // elements when the selector produces new objects with identical field
@@ -335,6 +345,22 @@ export default function Sidebar({
   const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
     const state = store.getState()
+    const concernSession = provider === 'amplifier'
+      ? concernSessions.get(item.sessionId)
+      : undefined
+
+    if (provider === 'amplifier') {
+      // Amplifier entries always use the read-only Concern OS route. If the
+      // catalog is temporarily unavailable, the pane fails closed instead of
+      // falling through to terminal.create or amplifier resume.
+      dispatch(openExistingPaneTab({
+        sessionId: concernSession?.session_id ?? item.sessionId,
+        title: item.title,
+        cwd: concernSession?.working_dir || item.cwd,
+      }))
+      onNavigate('terminal')
+      return
+    }
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
@@ -441,7 +467,7 @@ export default function Sidebar({
       }))
     }
     onNavigate('terminal')
-  }, [dispatch, onNavigate, store])
+  }, [concernSessions, dispatch, onNavigate, store])
 
   const nav = [
     { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
@@ -738,6 +764,15 @@ export default function Sidebar({
 
       {/* Session List */}
       <div className="flex flex-1 min-h-0 flex-col">
+        {concernSessionsError && (
+          <div
+            className="mx-3 mb-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 dark:text-amber-300"
+            role="status"
+            title={concernSessionsError}
+          >
+            Concern OS unavailable · Amplifier remains read-only
+          </div>
+        )}
         <div className="flex-1 min-h-0 px-2">
           {showBlockingLoad ? (
             <div
@@ -786,6 +821,7 @@ export default function Sidebar({
                     <div key={sessionKey} className="pb-0.5">
                       <SidebarItem
                         item={item}
+                        concernSession={item.provider === 'amplifier' ? concernSessions.get(item.sessionId) : undefined}
                         isActiveTab={isActive}
                         isBusy={busySessionKeySet.has(sessionKey)}
                         showProjectBadge={settings.sidebar?.showProjectBadges}
@@ -807,6 +843,7 @@ export default function Sidebar({
 
 interface SidebarItemProps {
   item: SessionItem
+  concernSession?: ConcernSession
   isActiveTab?: boolean
   isBusy?: boolean
   showProjectBadge?: boolean
@@ -824,6 +861,9 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
   if (prev.isBusy !== next.isBusy) return false
   if (prev.showProjectBadge !== next.showProjectBadge) return false
   if (prev.timestampTick !== next.timestampTick) return false
+  if (prev.concernSession?.attention?.state !== next.concernSession?.attention?.state) return false
+  if (prev.concernSession?.attention?.severity !== next.concernSession?.attention?.severity) return false
+  if (prev.concernSession?.live !== next.concernSession?.live) return false
 
   const a = prev.item, b = next.item
   return (
@@ -846,7 +886,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 }
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
-  const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
+  const { item, concernSession, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
@@ -894,6 +934,22 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               {item.archived && (
                 <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
               )}
+              {concernSession?.attention && (
+                <span
+                  className={cn(
+                    'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium uppercase leading-none',
+                    concernSession.attention.state === 'needs' && 'bg-red-500/15 text-red-600 dark:text-red-400',
+                    concernSession.attention.state === 'ready' && 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
+                    concernSession.attention.state === 'working' && 'bg-blue-500/15 text-blue-600 dark:text-blue-400',
+                    concernSession.attention.state === 'idle' && 'bg-muted text-muted-foreground',
+                  )}
+                  data-testid="concern-attention-badge"
+                  data-attention-state={concernSession.attention.state}
+                  title={concernSession.attention.why}
+                >
+                  {concernSession.attention.state}
+                </span>
+              )}
             </div>
             {item.subtitle && showProjectBadge && (
               <div className="text-2xs text-muted-foreground truncate">
@@ -911,6 +967,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
       <TooltipContent>
         <div>{sessionLabel}: {item.title}</div>
         <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
+        {concernSession?.attention && (
+          <div className="text-muted-foreground">
+            {concernSession.attention.state}: {concernSession.attention.why}
+          </div>
+        )}
       </TooltipContent>
     </Tooltip>
   )

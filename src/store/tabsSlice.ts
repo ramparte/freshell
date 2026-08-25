@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, setActivePane, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -785,6 +785,51 @@ export const openSessionTab = createAsyncThunk(
       content: desiredResumeContent,
     }))
   }
+)
+
+/**
+ * Opens a Concern OS-owned Amplifier record without constructing a terminal or
+ * invoking any provider restore/resume flow. Repeated clicks focus one tab.
+ */
+export const openExistingPaneTab = createAsyncThunk(
+  'tabs/openExistingPaneTab',
+  async (
+    { sessionId, title, cwd }: { sessionId: string; title?: string; cwd?: string },
+    { dispatch, getState },
+  ) => {
+    const state = getState() as RootState
+    const findExisting = (node: PaneNode): string | undefined => {
+      if (node.type === 'leaf') {
+        return node.content.kind === 'existing-pane' && node.content.sessionId === sessionId
+          ? node.id
+          : undefined
+      }
+      return findExisting(node.children[0]) ?? findExisting(node.children[1])
+    }
+
+    for (const tab of state.tabs.tabs) {
+      const layout = state.panes.layouts[tab.id]
+      if (!layout) continue
+      const paneId = findExisting(layout)
+      if (!paneId) continue
+      dispatch(setActiveTab(tab.id))
+      dispatch(setActivePane({ tabId: tab.id, paneId }))
+      return
+    }
+
+    const tabId = nanoid()
+    dispatch(addTab({
+      id: tabId,
+      title: title || (cwd ? basenameSegment(cwd) : null) || 'Amplifier session',
+      mode: 'shell',
+      status: 'running',
+      initialCwd: cwd,
+    }))
+    dispatch(initLayout({
+      tabId,
+      content: { kind: 'existing-pane', sessionId, title, cwd },
+    }))
+  },
 )
 
 export default tabsSlice.reducer

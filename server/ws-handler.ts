@@ -116,6 +116,10 @@ import {
   makeFreshAgentProviderErrorEvent,
   normalizeFreshAgentProviderEvent,
 } from './fresh-agent/sdk-events.js'
+import {
+  EXISTING_PANES_ONLY_MESSAGE,
+  existingPanesOnly,
+} from './existing-panes-policy.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -983,6 +987,9 @@ export class WsHandler {
   }
 
   private assertTerminalCreateAccepted(): void {
+    if (existingPanesOnly()) {
+      throw new TerminalCreateAdmissionError(EXISTING_PANES_ONLY_MESSAGE)
+    }
     if (this.closed) {
       throw new TerminalCreateAdmissionError('Server is shutting down; terminal.create is no longer accepted.')
     }
@@ -1918,6 +1925,18 @@ export class WsHandler {
       if (!state.authenticated) {
         this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Send hello first' })
         ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Not authenticated')
+        return
+      }
+
+      if (
+        existingPanesOnly()
+        && (m.type === 'terminal.create' || m.type === 'codingcli.create')
+      ) {
+        this.sendError(ws, {
+          code: 'INVALID_CREATE_REQUEST',
+          message: EXISTING_PANES_ONLY_MESSAGE,
+          requestId: m.requestId,
+        })
         return
       }
 

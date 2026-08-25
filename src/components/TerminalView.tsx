@@ -29,6 +29,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
+import { ExistingPaneView } from '@/components/ExistingPaneView'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -529,10 +530,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
+  // This derived demo image is a read-only Amplifier session viewer. Amplifier
+  // sessions must never enter the PTY create/attach lifecycle: the runtime
+  // command is deliberately disabled and the session store is mounted
+  // read-only. Other pane types retain upstream behavior.
+  const viewerOnly = paneContent.kind === 'terminal' && paneContent.mode === 'amplifier'
   // Playwright can opt a pane into state-only mode so activity chrome tests
   // don't race the live terminal create/attach lifecycle.
-  const suppressNetworkEffects = typeof window !== 'undefined'
+  const suppressNetworkEffects = viewerOnly || (
+    typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
+  )
   const [isAttaching, setIsAttaching] = useState(false)
   const [truncatedHistoryGap, setTruncatedHistoryGap] = useState<{ fromSeq: number; toSeq: number } | null>(null)
   const [backgroundHydrationTriggered, setBackgroundHydrationTriggered] = useState(false)
@@ -4363,6 +4371,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
     return null
+  }
+
+  if (viewerOnly) {
+    const sessionId = terminalContent.sessionRef?.sessionId || terminalContent.resumeSessionId || 'Unknown'
+    const cwd = terminalContent.initialCwd || tab?.initialCwd || 'Not recorded'
+    return (
+      <ExistingPaneView
+        sessionId={sessionId}
+        title={tab?.title}
+        cwd={cwd}
+        hidden={hidden}
+        focused={shouldFocusActiveTerminal}
+      />
+    )
   }
 
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)

@@ -65,6 +65,12 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         extensionName: content.extensionName,
         props: content.props,
       }
+    case 'existing-pane':
+      return {
+        sessionId: content.sessionId,
+        title: content.title,
+        cwd: content.cwd,
+      }
     case 'picker':
     default:
       return {}

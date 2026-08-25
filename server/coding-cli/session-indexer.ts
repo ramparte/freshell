@@ -335,12 +335,13 @@ async function readLightweightMeta(
             || obj?.payload?.id || obj?.message?.sessionId
         }
         if (!cwd) {
-          const c = obj?.cwd || obj?.context?.cwd || obj?.payload?.cwd
+          const c = obj?.cwd || obj?.working_dir || obj?.context?.cwd || obj?.payload?.cwd
             || obj?.data?.cwd || obj?.message?.cwd
           if (typeof c === 'string' && (c.startsWith('/') || (IS_WINDOWS && /^[a-zA-Z]:/.test(c)))) cwd = c
         }
-        if (!createdAt && obj?.timestamp) {
-          const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+        const timestamp = obj?.timestamp ?? obj?.created
+        if (!createdAt && timestamp) {
+          const parsed = typeof timestamp === 'number' ? timestamp : Date.parse(timestamp)
           if (Number.isFinite(parsed)) createdAt = parsed
         }
         if (!title) {
@@ -1256,7 +1257,7 @@ export class CodingCliSessionIndexer {
         provider: provider.name,
         sessionId,
         projectPath,
-        lastActivityAt: meta.lastActivityAt || meta.mtimeMs,
+        lastActivityAt: Math.trunc(meta.lastActivityAt || meta.mtimeMs),
         createdAt: meta.createdAt,
         title: resolvedTitle,
         cwd: meta.cwd,

@@ -39,6 +39,10 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
     return <LayoutGrid className={className} />
   }
 
+  if (content.kind === 'existing-pane') {
+    return <Terminal className={className} />
+  }
+
   // Picker
   return <LayoutGrid className={className} />
 }

@@ -169,8 +169,9 @@ describe('amplifier-provider', () => {
         expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
 
         const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
-        expect(result).toBe(Math.max(transcriptMtimeMs, eventsMtimeMs))
-        expect(result).toBe(transcriptMtimeMs)
+        expect(result).toBe(Math.trunc(Math.max(transcriptMtimeMs, eventsMtimeMs)))
+        expect(result).toBe(Math.trunc(transcriptMtimeMs))
+        expect(Number.isInteger(result)).toBe(true)
       } finally {
         await fsp.rm(dir, { recursive: true, force: true })
       }
@@ -190,7 +191,8 @@ describe('amplifier-provider', () => {
 
         expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
         const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
-        expect(result).toBe(eventsMtimeMs)
+        expect(result).toBe(Math.trunc(eventsMtimeMs))
+        expect(Number.isInteger(result)).toBe(true)
       } finally {
         await fsp.rm(dir, { recursive: true, force: true })
       }

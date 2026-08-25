@@ -10,6 +10,7 @@ import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex'
+import { amplifierProvider } from '../../../../server/coding-cli/providers/amplifier'
 
 vi.mock('chokidar', async () => {
   const { EventEmitter } = await import('events')
@@ -2335,6 +2336,66 @@ describe('CodingCliSessionIndexer', () => {
       .find((session) => session.sessionId === olderSessionId)
 
     expect(olderSession?.title).toBe('Investigate sidebar visibility')
+  })
+
+  it('indexes Amplifier working_dir and created fields with integer lightweight timestamps', async () => {
+    const files: string[] = []
+    for (let i = 0; i < 151; i += 1) {
+      const sessionDir = path.join(tempDir, `recent-amplifier-${i}`)
+      const file = path.join(sessionDir, 'metadata.json')
+      await fsp.mkdir(sessionDir, { recursive: true })
+      await fsp.writeFile(file, JSON.stringify({
+        session_id: `recent-amplifier-${i}`,
+        working_dir: `/project/recent-${i}`,
+        created: new Date(2026, 3, 5, 12, i).toISOString(),
+      }))
+      files.push(file)
+    }
+
+    const createdSessionDir = path.join(tempDir, 'older-amplifier-created')
+    const createdSessionFile = path.join(createdSessionDir, 'metadata.json')
+    await fsp.mkdir(createdSessionDir)
+    await fsp.writeFile(createdSessionFile, JSON.stringify({
+      session_id: 'older-amplifier-created',
+      working_dir: '/project/amplifier-created',
+      created: '2026-01-01T00:00:00.123Z',
+    }))
+    files.push(createdSessionFile)
+
+    const mtimeSessionDir = path.join(tempDir, 'older-amplifier-mtime')
+    const mtimeSessionFile = path.join(mtimeSessionDir, 'metadata.json')
+    await fsp.mkdir(mtimeSessionDir)
+    await fsp.writeFile(mtimeSessionFile, JSON.stringify({
+      session_id: 'older-amplifier-mtime',
+      working_dir: '/project/amplifier-mtime',
+    }))
+    await fsp.utimes(mtimeSessionFile, 1_704_067_200.456, 1_704_067_200.456)
+    files.push(mtimeSessionFile)
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['amplifier'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'amplifier',
+      parseSessionFile: amplifierProvider.parseSessionFile,
+      extractSessionId: amplifierProvider.extractSessionId,
+    })
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects().flatMap((group) => group.sessions)
+    const createdSession = sessions.find((session) => session.sessionId === 'older-amplifier-created')
+    const mtimeSession = sessions.find((session) => session.sessionId === 'older-amplifier-mtime')
+
+    expect(createdSession).toMatchObject({
+      cwd: '/project/amplifier-created',
+      createdAt: Date.parse('2026-01-01T00:00:00.123Z'),
+    })
+    expect(Number.isInteger(createdSession?.lastActivityAt)).toBe(true)
+    expect(mtimeSession?.cwd).toBe('/project/amplifier-mtime')
+    expect(Number.isInteger(mtimeSession?.lastActivityAt)).toBe(true)
   })
 
   it('extracts a lightweight Claude generated summary title from the tail even when a later timestamp follows it', async () => {
