@@ -11,10 +11,10 @@ import {
 } from '@shared/concern-os-contract'
 import type { SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 
-async function getJson(path: string): Promise<unknown> {
+async function getJson(path: string, headers?: Record<string, string>): Promise<unknown> {
   const response = await fetch(path, {
     credentials: 'same-origin',
-    headers: { accept: 'application/json' },
+    headers: { accept: 'application/json', ...headers },
   })
   if (!response.ok) {
     throw new Error(`Concern OS session service returned HTTP ${response.status}`)
@@ -22,13 +22,18 @@ async function getJson(path: string): Promise<unknown> {
   return response.json()
 }
 
-async function postJson(path: string, body: unknown): Promise<unknown> {
+async function postJson(
+  path: string,
+  body: unknown,
+  headers?: Record<string, string>,
+): Promise<unknown> {
   const response = await fetch(path, {
     method: 'POST',
     credentials: 'same-origin',
     headers: {
       accept: 'application/json',
       'content-type': 'application/json',
+      ...headers,
     },
     body: JSON.stringify(body),
   })
@@ -53,20 +58,28 @@ export async function fetchConcernSession(id: string): Promise<ConcernSession> {
   return record.item
 }
 
-export async function fetchConcernPaneSnapshot(id: string): Promise<ConcernPaneSnapshot> {
+export async function fetchConcernPaneSnapshot(
+  id: string,
+  inputLease?: string,
+): Promise<ConcernPaneSnapshot> {
   return ConcernPaneSnapshotSchema.parse(
-    await getJson(`/api/concern-os/sessions/${encodeURIComponent(id)}/pane`),
+    await getJson(
+      `/api/concern-os/sessions/${encodeURIComponent(id)}/pane`,
+      inputLease ? { 'x-concern-pane-lease': inputLease } : undefined,
+    ),
   )
 }
 
 export async function sendConcernPaneInput(
   id: string,
+  inputLease: string,
   sequence: number,
   data: string,
 ): Promise<ConcernPaneInputResponse> {
   return ConcernPaneInputResponseSchema.parse(await postJson(
     `/api/concern-os/sessions/${encodeURIComponent(id)}/pane/input`,
     { sequence, data },
+    { 'x-concern-pane-lease': inputLease },
   ))
 }
 

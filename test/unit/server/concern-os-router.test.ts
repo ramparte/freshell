@@ -36,7 +36,7 @@ const session: ConcernSession = {
   },
 }
 
-type AdapterMethods = Pick<ExistingPaneAdapter, 'capture' | 'sendInput'>
+type AdapterMethods = Pick<ExistingPaneAdapter, 'capture' | 'captureWithLease' | 'sendInput'>
 
 function appWith(overrides: Partial<AdapterMethods> = {}) {
   const client = {
@@ -50,6 +50,17 @@ function appWith(overrides: Partial<AdapterMethods> = {}) {
       data: 'pane output',
       input_enabled: true,
       next_input_sequence: 1,
+      input_lease: 'lease-1',
+      lease_expires_at: 1_000,
+    })),
+    captureWithLease: vi.fn(async () => ({
+      ok: true as const,
+      pane_id: '%5' as const,
+      data: 'pane output',
+      input_enabled: true,
+      next_input_sequence: 1,
+      input_lease: 'lease-1',
+      lease_expires_at: 1_000,
     })),
     sendInput: vi.fn(async () => ({
       ok: true as const,
@@ -77,9 +88,24 @@ describe('Concern OS pane routes', () => {
       data: 'pane output',
       input_enabled: true,
       next_input_sequence: 1,
+      input_lease: 'lease-1',
+      lease_expires_at: 1_000,
     })
     expect(client.getSession).toHaveBeenCalledWith('session-1')
     expect(adapter.capture).toHaveBeenCalledWith(expect.objectContaining({ session_id: 'session-1' }))
+  })
+
+  it('uses a generation-bound lease for poll captures without re-querying the catalog', async () => {
+    const { app, client, adapter } = appWith()
+
+    const response = await request(app)
+      .get('/api/concern-os/sessions/session-1/pane')
+      .set('x-concern-pane-lease', 'lease-1')
+
+    expect(response.status).toBe(200)
+    expect(client.getSession).not.toHaveBeenCalled()
+    expect(adapter.capture).not.toHaveBeenCalled()
+    expect(adapter.captureWithLease).toHaveBeenCalledWith('session-1', 'lease-1')
   })
 
   it('rejects capture when the upstream canonical key does not match the requested session', async () => {
@@ -117,47 +143,37 @@ describe('Concern OS pane routes', () => {
     expect(response.body).not.toHaveProperty('item')
   })
 
-  it('rejects input before the adapter when the upstream key does not match the request', async () => {
+  it('requires a generation-bound lease before input', async () => {
     const { app, client, adapter } = appWith()
-    vi.mocked(client.getSession).mockResolvedValue({
-      ...structuredClone(session),
-      id: 'amplifier:different-session',
-    })
-
     const response = await request(app)
       .post('/api/concern-os/sessions/session-1/pane/input')
       .send({ sequence: 1, data: 'never sent' })
 
     expect(response.status).toBe(409)
+    expect(client.getSession).not.toHaveBeenCalled()
     expect(adapter.sendInput).not.toHaveBeenCalled()
   })
 
-  it('re-fetches the Concern OS mapping inside the serialized input operation', async () => {
+  it('uses the lease fast path without a per-input catalog query', async () => {
     const sendInput = vi.fn(async (
-      initial: ConcernSession,
+      _sessionId: string,
+      _lease: string,
       input: { sequence: number; data: string },
-      resolveCurrent: () => Promise<ConcernSession>,
-    ) => {
-      const current = await resolveCurrent()
-      expect(current).not.toBe(initial)
-      expect(current).toEqual(initial)
-      return { ok: true as const, pane_id: '%5' as const, sequence: input.sequence }
-    })
+    ) => ({ ok: true as const, pane_id: '%5' as const, sequence: input.sequence }))
     const { app, client } = appWith({ sendInput })
 
     const response = await request(app)
       .post('/api/concern-os/sessions/session-1/pane/input')
+      .set('x-concern-pane-lease', 'lease-1')
       .send({ sequence: 1, data: 'hello' })
 
     expect(response.status).toBe(200)
     expect(response.body).toEqual({ ok: true, pane_id: '%5', sequence: 1 })
-    expect(client.getSession).toHaveBeenCalledTimes(2)
-    expect(client.getSession).toHaveBeenNthCalledWith(1, 'session-1')
-    expect(client.getSession).toHaveBeenNthCalledWith(2, 'session-1')
+    expect(client.getSession).not.toHaveBeenCalled()
     expect(sendInput).toHaveBeenCalledWith(
-      expect.objectContaining({ session_id: 'session-1' }),
+      'session-1',
+      'lease-1',
       { sequence: 1, data: 'hello' },
-      expect.any(Function),
     )
   })
 
@@ -190,9 +206,11 @@ describe('Concern OS pane routes', () => {
 
     const staleResponse = await request(identityFailure.app)
       .post('/api/concern-os/sessions/session-1/pane/input')
+      .set('x-concern-pane-lease', 'lease-1')
       .send({ sequence: 1, data: 'x' })
     const sequenceResponse = await request(sequenceFailure.app)
       .post('/api/concern-os/sessions/session-1/pane/input')
+      .set('x-concern-pane-lease', 'lease-1')
       .send({ sequence: 1, data: 'x' })
 
     expect(staleResponse.status).toBe(409)

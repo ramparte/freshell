@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 import type {
@@ -16,6 +17,8 @@ const execFile = promisify(execFileCallback)
 const TMUX_IDENTITY_FORMAT = '#{pane_id}|#{pane_pid}|#{pid}'
 const TMUX_IDENTITY_MISMATCH_MARKER = '__FRESHELL_TMUX_IDENTITY_MISMATCH__'
 const MAX_CAPTURE_BYTES = 512 * 1024
+const CAPTURE_HISTORY_LINES = 200
+export const EXISTING_PANE_LEASE_TTL_MS = 10_000
 export const DEFAULT_FRESHELL_TMUX_SOCKET = '/run/host-tmux/default'
 
 type ExecFile = (
@@ -28,6 +31,15 @@ export type ExistingPaneAdapterOptions = {
   exec?: ExecFile
   readProcessStat?: (pid: number) => Promise<string>
   tmuxSocketPath?: string
+  now?: () => number
+  createLeaseToken?: () => string
+  leaseTtlMs?: number
+}
+
+type ExistingPaneLease = {
+  sessionId: string
+  identity: ConcernLiveIdentity
+  expiresAt: number
 }
 
 export class ExistingPaneIdentityError extends Error {
@@ -68,8 +80,12 @@ export class ExistingPaneAdapter {
   private readonly run: ExecFile
   private readonly readStat: (pid: number) => Promise<string>
   private readonly tmuxSocketPath: string
+  private readonly now: () => number
+  private readonly createLeaseToken: () => string
+  private readonly leaseTtlMs: number
   private readonly paneQueues = new Map<string, Promise<void>>()
   private readonly lastSequences = new Map<string, number>()
+  private readonly leases = new Map<string, ExistingPaneLease>()
 
   constructor(options: ExistingPaneAdapterOptions = {}) {
     this.run = options.exec ?? (async (file, args, commandOptions) => {
@@ -79,11 +95,33 @@ export class ExistingPaneAdapter {
     this.readStat = options.readProcessStat
       ?? ((pid) => readFile(`/proc/${pid}/stat`, 'utf8'))
     this.tmuxSocketPath = resolveTmuxSocketPath(options.tmuxSocketPath)
+    this.now = options.now ?? Date.now
+    this.createLeaseToken = options.createLeaseToken
+      ?? (() => randomBytes(32).toString('base64url'))
+    this.leaseTtlMs = options.leaseTtlMs ?? EXISTING_PANE_LEASE_TTL_MS
   }
 
   async capture(session: ConcernSession): Promise<ConcernPaneSnapshot> {
     const identity = this.requireIdentity(session)
+    const data = await this.captureIdentity(identity)
+    const lease = this.issueLease(session.id, identity)
 
+    return this.snapshot(identity, data, lease)
+  }
+
+  async captureWithLease(
+    requestedSessionId: string,
+    leaseToken: string,
+  ): Promise<ConcernPaneSnapshot> {
+    const lease = this.requireLease(requestedSessionId, leaseToken)
+    const data = await this.captureIdentity(lease.identity)
+    // A successful full identity validation renews the short lease. Polling is
+    // therefore the heartbeat; closing the browser lets write authority expire.
+    lease.expiresAt = this.now() + this.leaseTtlMs
+    return this.snapshot(lease.identity, data, { token: leaseToken, ...lease })
+  }
+
+  private async captureIdentity(identity: ConcernLiveIdentity): Promise<string> {
     await this.validate(identity)
     const { stdout } = await this.run('tmux', this.tmuxArgs([
       'capture-pane',
@@ -93,32 +131,42 @@ export class ExistingPaneAdapter {
       '-t',
       identity.pane_id,
       '-S',
-      '-5000',
+      `-${CAPTURE_HISTORY_LINES}`,
     ]), { encoding: 'utf8', maxBuffer: MAX_CAPTURE_BYTES })
     // Validate again so output cannot be returned across a pane/PID generation race.
     await this.validate(identity)
+    return stdout
+  }
 
+  private snapshot(
+    identity: ConcernLiveIdentity,
+    data: string,
+    lease: ExistingPaneLease & { token: string },
+  ): ConcernPaneSnapshot {
     return {
       ok: true,
       pane_id: identity.pane_id,
-      data: stdout,
+      data,
       input_enabled: true,
       next_input_sequence: this.nextSequence(identity),
+      input_lease: lease.token,
+      lease_expires_at: lease.expiresAt,
     }
   }
 
   async sendInput(
-    initialSession: ConcernSession,
+    requestedSessionId: string,
+    leaseToken: string,
     input: ConcernPaneInputRequest,
-    resolveCurrentSession: () => Promise<ConcernSession>,
   ): Promise<ConcernPaneInputResponse> {
-    const initialIdentity = this.requireIdentity(initialSession)
-    const queueKey = this.queueKey(initialIdentity)
+    const initialLease = this.requireLease(requestedSessionId, leaseToken)
+    const queueKey = this.queueKey(initialLease.identity)
 
     return this.enqueue(queueKey, async () => {
-      const currentSession = await resolveCurrentSession()
-      const currentIdentity = this.requireIdentity(currentSession)
-      this.assertSameMapping(initialSession, initialIdentity, currentSession, currentIdentity)
+      // Re-check at the FIFO head so an input queued behind a slow write cannot
+      // outlive its generation-bound lease.
+      const currentLease = this.requireLease(requestedSessionId, leaseToken)
+      const currentIdentity = currentLease.identity
 
       const bytes = encodeTmuxHexBytes(input.data)
       if (bytes.length === 0 || bytes.length > MAX_CONCERN_PANE_INPUT_BYTES) {
@@ -152,6 +200,46 @@ export class ExistingPaneAdapter {
     })
   }
 
+  private issueLease(
+    sessionId: string,
+    identity: ConcernLiveIdentity,
+  ): ExistingPaneLease & { token: string } {
+    const now = this.now()
+    for (const [token, lease] of this.leases) {
+      if (lease.expiresAt <= now) this.leases.delete(token)
+    }
+    const token = this.createLeaseToken()
+    const lease = {
+      sessionId: this.canonicalSessionId(sessionId),
+      identity: structuredClone(identity),
+      expiresAt: now + this.leaseTtlMs,
+    }
+    this.leases.set(token, lease)
+    return { token, ...lease }
+  }
+
+  private requireLease(
+    requestedSessionId: string,
+    leaseToken: string,
+  ): ExistingPaneLease {
+    const lease = this.leases.get(leaseToken)
+    if (
+      !lease
+      || lease.sessionId !== this.canonicalSessionId(requestedSessionId)
+      || lease.expiresAt <= this.now()
+    ) {
+      if (lease?.expiresAt && lease.expiresAt <= this.now()) this.leases.delete(leaseToken)
+      throw new ExistingPaneIdentityError(
+        'The generation-bound tmux input lease expired or does not match this session.',
+      )
+    }
+    return lease
+  }
+
+  private canonicalSessionId(sessionId: string): string {
+    return sessionId.startsWith('amplifier:') ? sessionId : `amplifier:${sessionId}`
+  }
+
   private requireIdentity(session: ConcernSession): ConcernLiveIdentity {
     if (!session.live || session.attachment?.state !== 'resolvable') {
       throw new ExistingPaneIdentityError('Session is not uniquely attached to a live tmux pane.')
@@ -178,21 +266,6 @@ export class ExistingPaneAdapter {
       throw new ExistingPaneIdentityError('Concern OS returned inconsistent pane identity.')
     }
     return identity
-  }
-
-  private assertSameMapping(
-    initialSession: ConcernSession,
-    initialIdentity: ConcernLiveIdentity,
-    currentSession: ConcernSession,
-    currentIdentity: ConcernLiveIdentity,
-  ): void {
-    if (
-      currentSession.id !== initialSession.id
-      || currentSession.session_id !== initialSession.session_id
-      || JSON.stringify(currentIdentity) !== JSON.stringify(initialIdentity)
-    ) {
-      throw new ExistingPaneIdentityError('Concern OS pane mapping changed before input.')
-    }
   }
 
   private queueKey(identity: ConcernLiveIdentity): string {

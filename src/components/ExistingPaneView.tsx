@@ -10,7 +10,8 @@ import {
 } from '@/lib/concern-os-sessions'
 import {
   canSendExistingPaneInput,
-  splitExistingPaneInput,
+  createExistingPaneInputBatcher,
+  type ExistingPaneInputBatcher,
 } from '@/lib/existing-pane-input'
 
 type ViewState =
@@ -36,7 +37,8 @@ export function ExistingPaneView({
   const hostRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal>()
   const inputHandlerRef = useRef<(data: string) => void>(() => undefined)
-  const inputQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const inputBatcherRef = useRef<ExistingPaneInputBatcher>()
+  const inputLeaseRef = useRef<string>()
   const nextInputSequenceRef = useRef(1)
   const inputFailedRef = useRef(false)
   const activeSessionIdRef = useRef<string>()
@@ -71,45 +73,7 @@ export function ExistingPaneView({
       return
     }
 
-    const chunks = splitExistingPaneInput(data)
-    if (chunks.length === 0) return
-    const requestedSessionId = sessionId
-
-    const send = inputQueueRef.current.then(async () => {
-      for (const chunk of chunks) {
-        const currentHost = hostRef.current
-        if (
-          inputFailedRef.current
-          || activeSessionIdRef.current !== requestedSessionId
-          || !canSendExistingPaneInput({
-            viewState: stateKindRef.current,
-            paneFocused: paneFocusedRef.current,
-            browserFocused: browserFocusedRef.current,
-            terminalFocused: !!currentHost?.contains(document.activeElement),
-            hidden: hiddenRef.current,
-          })
-        ) {
-          return
-        }
-
-        const sequence = nextInputSequenceRef.current
-        const response = await sendConcernPaneInput(requestedSessionId, sequence, chunk)
-        if (response.sequence !== sequence) {
-          throw new Error('Existing-pane input acknowledgement sequence changed.')
-        }
-        nextInputSequenceRef.current = sequence + 1
-      }
-    })
-
-    inputQueueRef.current = send.catch((error) => {
-      if (activeSessionIdRef.current !== requestedSessionId || inputFailedRef.current) return
-      inputFailedRef.current = true
-      if (terminalRef.current) terminalRef.current.options.disableStdin = true
-      setState({
-        kind: 'ended',
-        message: error instanceof Error ? error.message : 'Existing tmux pane input failed.',
-      })
-    })
+    inputBatcherRef.current?.enqueue(data)
   }
 
   useEffect(() => {
@@ -201,12 +165,46 @@ export function ExistingPaneView({
     let lastData: string | undefined
     activeSessionIdRef.current = sessionId
     inputFailedRef.current = false
+    inputLeaseRef.current = undefined
     nextInputSequenceRef.current = 1
-    inputQueueRef.current = Promise.resolve()
+    inputBatcherRef.current?.dispose()
+    inputBatcherRef.current = createExistingPaneInputBatcher(
+      async (chunk) => {
+        const currentHost = hostRef.current
+        if (!canSendExistingPaneInput({
+          viewState: stateKindRef.current,
+          paneFocused: paneFocusedRef.current,
+          browserFocused: browserFocusedRef.current,
+          terminalFocused: !!currentHost?.contains(document.activeElement),
+          hidden: hiddenRef.current,
+        })) {
+          return
+        }
+        const lease = inputLeaseRef.current
+        if (!lease || activeSessionIdRef.current !== sessionId) {
+          throw new Error('The generation-bound tmux input lease is unavailable.')
+        }
+        const sequence = nextInputSequenceRef.current
+        const response = await sendConcernPaneInput(sessionId, lease, sequence, chunk)
+        if (response.sequence !== sequence) {
+          throw new Error('Existing-pane input acknowledgement sequence changed.')
+        }
+        nextInputSequenceRef.current = sequence + 1
+      },
+      (error) => {
+        if (activeSessionIdRef.current !== sessionId || inputFailedRef.current) return
+        inputFailedRef.current = true
+        if (terminalRef.current) terminalRef.current.options.disableStdin = true
+        setState({
+          kind: 'ended',
+          message: error instanceof Error ? error.message : 'Existing tmux pane input failed.',
+        })
+      },
+    )
 
     const pollPane = async () => {
       try {
-        const snapshot = await fetchConcernPaneSnapshot(sessionId)
+        const snapshot = await fetchConcernPaneSnapshot(sessionId, inputLeaseRef.current)
         if (cancelled || inputFailedRef.current) return
         if (!snapshot.input_enabled) {
           throw new Error('Existing tmux pane input is not available.')
@@ -215,6 +213,7 @@ export function ExistingPaneView({
           nextInputSequenceRef.current,
           snapshot.next_input_sequence,
         )
+        inputLeaseRef.current = snapshot.input_lease
         // capture-pane returns a complete bounded snapshot. Replace the local
         // model only when it changes so polling cannot duplicate scrollback or
         // queue redundant full-screen writes.
@@ -224,7 +223,10 @@ export function ExistingPaneView({
           terminalRef.current?.write(snapshot.data)
         }
         setState({ kind: 'live', paneId: snapshot.pane_id })
-        timer = setTimeout(pollPane, 750)
+        const interactive = paneFocusedRef.current
+          && browserFocusedRef.current
+          && !hiddenRef.current
+        timer = setTimeout(pollPane, interactive ? 100 : 750)
       } catch (error) {
         if (!cancelled) {
           setState({
@@ -269,6 +271,9 @@ export function ExistingPaneView({
         activeSessionIdRef.current = undefined
         inputFailedRef.current = true
       }
+      inputLeaseRef.current = undefined
+      inputBatcherRef.current?.dispose()
+      inputBatcherRef.current = undefined
       if (timer) clearTimeout(timer)
     }
   }, [sessionId])

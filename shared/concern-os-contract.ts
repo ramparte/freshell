@@ -72,6 +72,8 @@ export const ConcernPaneSnapshotSchema = z.object({
   data: z.string(),
   input_enabled: z.boolean(),
   next_input_sequence: z.number().int().positive(),
+  input_lease: NonEmptyString,
+  lease_expires_at: z.number().int().positive(),
 }).passthrough()
 
 export const ConcernPaneInputRequestSchema = z.object({

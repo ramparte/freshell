@@ -61,8 +61,13 @@ export function createConcernOsRouter(
 
   router.get('/concern-os/sessions/:sessionId/pane', async (req, res) => {
     try {
-      const session = await getRequestedSession(client, req.params.sessionId)
-      res.json(await paneAdapter.capture(session))
+      const lease = req.headers['x-concern-pane-lease']
+      if (typeof lease === 'string' && lease.length > 0) {
+        res.json(await paneAdapter.captureWithLease(req.params.sessionId, lease))
+      } else {
+        const session = await getRequestedSession(client, req.params.sessionId)
+        res.json(await paneAdapter.capture(session))
+      }
     } catch (error) {
       const identityFailure = error instanceof ExistingPaneIdentityError
       res.status(identityFailure ? 409 : 502).json({
@@ -87,12 +92,12 @@ export function createConcernOsRouter(
     }
 
     try {
-      const initialSession = await getRequestedSession(client, req.params.sessionId)
-      res.json(await paneAdapter.sendInput(
-        initialSession,
-        parsed.data,
-        () => getRequestedSession(client, req.params.sessionId),
-      ))
+      const lease = req.headers['x-concern-pane-lease']
+      if (typeof lease !== 'string' || lease.length === 0) {
+        res.status(409).json({ ok: false, error: 'A generation-bound tmux input lease is required.' })
+        return
+      }
+      res.json(await paneAdapter.sendInput(req.params.sessionId, lease, parsed.data))
     } catch (error) {
       const conflict = error instanceof ExistingPaneIdentityError
         || error instanceof ExistingPaneInputError
