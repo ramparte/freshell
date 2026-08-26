@@ -30,6 +30,40 @@ export const EXISTING_PANE_BACKGROUND_POLL_MS = 750
 export const EXISTING_PANE_FAST_POLL_MS = 50
 export const EXISTING_PANE_FAST_POLL_BURST_MS = 800
 
+const EXISTING_PANE_FOCUS_OWNER_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  '[contenteditable="true"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="combobox"]',
+  '[role="dialog"]',
+  '[aria-modal="true"]',
+  '[role="menu"]',
+  '[role="menuitem"]',
+  '[role="listbox"]',
+].join(',')
+
+const EXISTING_PANE_OPEN_OVERLAY_SELECTOR = [
+  'dialog[open]',
+  '[role="dialog"]',
+  '[aria-modal="true"]',
+  '[role="menu"]',
+  '[role="listbox"]',
+].join(',')
+
+function canAutoFocusExistingPane(host: HTMLElement): boolean {
+  const activeElement = document.activeElement
+  if (document.querySelector(EXISTING_PANE_OPEN_OVERLAY_SELECTOR)) return false
+  if (activeElement && host.contains(activeElement)) return true
+  if (!activeElement || activeElement === document.body || activeElement === document.documentElement) {
+    return true
+  }
+
+  return !activeElement.closest(EXISTING_PANE_FOCUS_OWNER_SELECTOR)
+}
+
 export function ExistingPaneView({
   sessionId,
   title,
@@ -169,6 +203,43 @@ export function ExistingPaneView({
       && !inputFailedRef.current
     )
   }, [browserFocused, focused, hidden, state.kind])
+
+  useEffect(() => {
+    if (
+      state.kind !== 'live'
+      || !focused
+      || !browserFocused
+      || hidden
+      || inputFailedRef.current
+    ) {
+      return
+    }
+
+    const host = hostRef.current
+    const terminal = terminalRef.current
+    if (!host || !terminal || !canAutoFocusExistingPane(host)) return
+
+    // The live state is established by the first validated capture. Wait one
+    // frame so React has exposed the terminal host and xterm has rendered its
+    // hidden textarea before focusing it.
+    const frame = requestAnimationFrame(() => {
+      if (
+        stateKindRef.current !== 'live'
+        || !paneFocusedRef.current
+        || !browserFocusedRef.current
+        || hiddenRef.current
+        || inputFailedRef.current
+        || document.visibilityState !== 'visible'
+        || !document.hasFocus()
+        || !canAutoFocusExistingPane(host)
+      ) {
+        return
+      }
+      terminal.focus()
+    })
+
+    return () => cancelAnimationFrame(frame)
+  }, [browserFocused, focused, hidden, sessionId, state.kind])
 
   useEffect(() => {
     capturePollerRef.current?.refreshActivity()
