@@ -13,6 +13,10 @@ import {
   createExistingPaneInputBatcher,
   type ExistingPaneInputBatcher,
 } from '@/lib/existing-pane-input'
+import {
+  createAdaptiveExistingPanePoller,
+  type AdaptiveExistingPanePoller,
+} from '@/lib/existing-pane-polling'
 
 type ViewState =
   | { kind: 'loading'; message: string }
@@ -23,6 +27,8 @@ type ViewState =
 
 export const EXISTING_PANE_FOCUSED_POLL_MS = 250
 export const EXISTING_PANE_BACKGROUND_POLL_MS = 750
+export const EXISTING_PANE_FAST_POLL_MS = 50
+export const EXISTING_PANE_FAST_POLL_BURST_MS = 800
 
 export function ExistingPaneView({
   sessionId,
@@ -41,6 +47,7 @@ export function ExistingPaneView({
   const terminalRef = useRef<Terminal>()
   const inputHandlerRef = useRef<(data: string) => void>(() => undefined)
   const inputBatcherRef = useRef<ExistingPaneInputBatcher>()
+  const capturePollerRef = useRef<AdaptiveExistingPanePoller>()
   const inputLeaseRef = useRef<string>()
   const nextInputSequenceRef = useRef(1)
   const inputFailedRef = useRef(false)
@@ -77,6 +84,7 @@ export function ExistingPaneView({
     }
 
     inputBatcherRef.current?.enqueue(data)
+    capturePollerRef.current?.wakeAfterInput()
   }
 
   useEffect(() => {
@@ -163,8 +171,11 @@ export function ExistingPaneView({
   }, [browserFocused, focused, hidden, state.kind])
 
   useEffect(() => {
+    capturePollerRef.current?.refreshActivity()
+  }, [browserFocused, focused, hidden])
+
+  useEffect(() => {
     let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
     let lastData: string | undefined
     activeSessionIdRef.current = sessionId
     inputFailedRef.current = false
@@ -197,6 +208,7 @@ export function ExistingPaneView({
       (error) => {
         if (activeSessionIdRef.current !== sessionId || inputFailedRef.current) return
         inputFailedRef.current = true
+        capturePollerRef.current?.stop()
         if (terminalRef.current) terminalRef.current.options.disableStdin = true
         setState({
           kind: 'ended',
@@ -206,42 +218,47 @@ export function ExistingPaneView({
     )
 
     const pollPane = async () => {
-      try {
-        const snapshot = await fetchConcernPaneSnapshot(sessionId, inputLeaseRef.current)
-        if (cancelled || inputFailedRef.current) return
-        if (!snapshot.input_enabled) {
-          throw new Error('Existing tmux pane input is not available.')
-        }
-        nextInputSequenceRef.current = Math.max(
-          nextInputSequenceRef.current,
-          snapshot.next_input_sequence,
-        )
-        inputLeaseRef.current = snapshot.input_lease
-        // capture-pane returns a complete bounded snapshot. Replace the local
-        // model only when it changes so polling cannot duplicate scrollback or
-        // queue redundant full-screen writes.
-        if (snapshot.data !== lastData) {
-          lastData = snapshot.data
-          terminalRef.current?.reset()
-          terminalRef.current?.write(snapshot.data)
-        }
-        setState({ kind: 'live', paneId: snapshot.pane_id })
-        const interactive = paneFocusedRef.current
-          && browserFocusedRef.current
-          && !hiddenRef.current
-        timer = setTimeout(
-          pollPane,
-          interactive ? EXISTING_PANE_FOCUSED_POLL_MS : EXISTING_PANE_BACKGROUND_POLL_MS,
-        )
-      } catch (error) {
-        if (!cancelled) {
-          setState({
-            kind: 'ended',
-            message: error instanceof Error ? error.message : 'Existing tmux pane ended.',
-          })
-        }
+      const snapshot = await fetchConcernPaneSnapshot(sessionId, inputLeaseRef.current)
+      if (cancelled || inputFailedRef.current) return
+      if (!snapshot.input_enabled) {
+        throw new Error('Existing tmux pane input is not available.')
       }
+      nextInputSequenceRef.current = Math.max(
+        nextInputSequenceRef.current,
+        snapshot.next_input_sequence,
+      )
+      inputLeaseRef.current = snapshot.input_lease
+      // capture-pane returns a complete bounded snapshot. Replace the local
+      // model only when it changes so polling cannot duplicate scrollback or
+      // queue redundant full-screen writes.
+      if (snapshot.data !== lastData) {
+        lastData = snapshot.data
+        terminalRef.current?.reset()
+        terminalRef.current?.write(snapshot.data)
+      }
+      setState({ kind: 'live', paneId: snapshot.pane_id })
     }
+
+    const capturePoller = createAdaptiveExistingPanePoller({
+      poll: pollPane,
+      isInteractive: () => (
+        paneFocusedRef.current
+        && browserFocusedRef.current
+        && !hiddenRef.current
+      ),
+      onError: (error) => {
+        if (cancelled) return
+        setState({
+          kind: 'ended',
+          message: error instanceof Error ? error.message : 'Existing tmux pane ended.',
+        })
+      },
+      focusedPollMs: EXISTING_PANE_FOCUSED_POLL_MS,
+      backgroundPollMs: EXISTING_PANE_BACKGROUND_POLL_MS,
+      fastPollMs: EXISTING_PANE_FAST_POLL_MS,
+      fastBurstMs: EXISTING_PANE_FAST_POLL_BURST_MS,
+    })
+    capturePollerRef.current = capturePoller
 
     void fetchConcernSession(sessionId)
       .then((session) => {
@@ -249,7 +266,7 @@ export function ExistingPaneView({
         const route = routeAmplifierSession(session)
         if (route === 'live') {
           setState({ kind: 'loading', message: 'Opening generation-validated tmux pane…' })
-          void pollPane()
+          capturePoller.start()
         } else if (route === 'historical') {
           setState({
             kind: 'historical',
@@ -280,7 +297,10 @@ export function ExistingPaneView({
       inputLeaseRef.current = undefined
       inputBatcherRef.current?.dispose()
       inputBatcherRef.current = undefined
-      if (timer) clearTimeout(timer)
+      capturePoller.stop()
+      if (capturePollerRef.current === capturePoller) {
+        capturePollerRef.current = undefined
+      }
     }
   }, [sessionId])
 
