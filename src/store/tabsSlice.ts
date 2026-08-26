@@ -48,6 +48,9 @@ function matchesDesiredResumeContentKind(
 export interface TabsState {
   tabs: Tab[]
   activeTabId: string | null
+  // Ephemeral, monotonic user-intent signal. Consumers must not infer focus
+  // intent from activeTabId changes, hydration, or unrelated rerenders.
+  focusActivation?: { tabId: string; token: number }
   // Ephemeral UI signal: request TabBar to enter inline rename mode for a tab.
   // This must never be persisted.
   renameRequestTabId: string | null
@@ -218,6 +221,7 @@ function loadInitialTabsState(): TabsState {
   const defaultState: TabsState = {
     tabs: [],
     activeTabId: null,
+    focusActivation: undefined,
     renameRequestTabId: null,
     tombstones: [],
   }
@@ -247,6 +251,7 @@ function loadInitialTabsState(): TabsState {
     return {
       tabs: mappedTabs,
       activeTabId: has ? desired! : (mappedTabs[0]?.id ?? null),
+      focusActivation: undefined,
       renameRequestTabId: null,
       tombstones: Array.isArray(layout.tombstones) ? layout.tombstones : [],
     }
@@ -257,6 +262,13 @@ function loadInitialTabsState(): TabsState {
 }
 
 const initialState: TabsState = loadInitialTabsState()
+
+function recordFocusActivation(state: TabsState, tabId: string) {
+  state.focusActivation = {
+    tabId,
+    token: (state.focusActivation?.token ?? 0) + 1,
+  }
+}
 
 type AddTabPayload = {
   id?: string
@@ -311,6 +323,10 @@ export const tabsSlice = createSlice({
     },
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload
+    },
+    activateTab: (state, action: PayloadAction<string>) => {
+      state.activeTabId = action.payload
+      recordFocusActivation(state, action.payload)
     },
     requestTabRename: (state, action: PayloadAction<string>) => {
       state.renameRequestTabId = action.payload
@@ -412,12 +428,14 @@ export const tabsSlice = createSlice({
       const currentIndex = state.tabs.findIndex((t) => t.id === state.activeTabId)
       const nextIndex = (currentIndex + 1) % state.tabs.length
       state.activeTabId = state.tabs[nextIndex].id
+      recordFocusActivation(state, state.activeTabId)
     },
     switchToPrevTab: (state) => {
       if (state.tabs.length <= 1) return
       const currentIndex = state.tabs.findIndex((t) => t.id === state.activeTabId)
       const prevIndex = (currentIndex - 1 + state.tabs.length) % state.tabs.length
       state.activeTabId = state.tabs[prevIndex].id
+      recordFocusActivation(state, state.activeTabId)
     },
   },
 })
@@ -425,6 +443,7 @@ export const tabsSlice = createSlice({
 export const {
   addTab,
   setActiveTab,
+  activateTab,
   requestTabRename,
   clearTabRenameRequest,
   updateTab,
@@ -812,8 +831,8 @@ export const openExistingPaneTab = createAsyncThunk(
       if (!layout) continue
       const paneId = findExisting(layout)
       if (!paneId) continue
-      dispatch(setActiveTab(tab.id))
       dispatch(setActivePane({ tabId: tab.id, paneId }))
+      dispatch(activateTab(tab.id))
       return
     }
 
@@ -829,6 +848,7 @@ export const openExistingPaneTab = createAsyncThunk(
       tabId,
       content: { kind: 'existing-pane', sessionId, title, cwd },
     }))
+    dispatch(activateTab(tabId))
   },
 )
 

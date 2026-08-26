@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, {
   addTab,
+  activateTab,
   setActiveTab,
   updateTab,
   removeTab,
@@ -67,6 +68,7 @@ describe('tabsSlice', () => {
       expect(tab.createRequestId).toBe(tab.id)
       expect(tab.createdAt).toBeDefined()
       expect(state.activeTabId).toBe(tab.id)
+      expect(state.focusActivation).toBeUndefined()
     })
 
     it('does not force initialCwd by default (lets server apply defaultCwd)', () => {
@@ -169,6 +171,20 @@ describe('tabsSlice', () => {
       // Switch to first tab
       state = tabsReducer(state, setActiveTab(firstTabId))
       expect(state.activeTabId).toBe(firstTabId)
+      expect(state.focusActivation).toBeUndefined()
+    })
+
+    it('records monotonic focus intent only for explicit tab activation', () => {
+      let state = tabsReducer(undefined, addTab({ id: 'first' }))
+      state = tabsReducer(state, addTab({ id: 'second' }))
+      state = tabsReducer(state, setActiveTab('first'))
+      expect(state.focusActivation).toBeUndefined()
+
+      state = tabsReducer(state, activateTab('second'))
+      expect(state.focusActivation).toEqual({ tabId: 'second', token: 1 })
+
+      state = tabsReducer(state, activateTab('first'))
+      expect(state.focusActivation).toEqual({ tabId: 'first', token: 2 })
     })
 
     it('allows setting activeTabId to any string', () => {

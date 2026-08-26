@@ -521,6 +521,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+  const focusActivation = useAppSelector((s) => (
+    s.tabs.focusActivation?.tabId === tabId
+      ? s.tabs.focusActivation.token
+      : 0
+  ))
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
@@ -4379,10 +4384,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     return (
       <ExistingPaneView
         sessionId={sessionId}
+        tabId={tabId}
         title={tab?.title}
         cwd={cwd}
         hidden={hidden}
         focused={shouldFocusActiveTerminal}
+        focusActivation={focusActivation}
       />
     )
   }

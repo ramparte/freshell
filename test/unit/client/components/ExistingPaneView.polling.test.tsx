@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   pollerRefresh: vi.fn(),
   pollerStop: vi.fn(),
   poll: undefined as (() => Promise<void>) | undefined,
+  controlMode: 'amplifier_bound' as 'amplifier_bound' | 'shell_continuation',
 }))
 
 vi.mock('@xterm/xterm', () => ({
@@ -43,6 +44,9 @@ vi.mock('@/lib/concern-os-sessions', () => ({
     input_lease: 'lease',
     pane_id: '%1',
     data: 'server snapshot',
+    get control_mode() {
+      return mocks.controlMode
+    },
   }),
   sendConcernPaneInput: vi.fn(),
 }))
@@ -70,13 +74,31 @@ vi.mock('@/lib/existing-pane-polling', () => ({
   }),
 }))
 
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
 import { ExistingPaneView } from '@/components/ExistingPaneView'
 
 describe('ExistingPaneView adaptive polling integration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(Terminal).mockImplementation(() => ({
+      loadAddon: vi.fn(),
+      open: vi.fn(),
+      onKey: vi.fn((handler) => {
+        mocks.keyHandler = handler
+        return { dispose: vi.fn() }
+      }),
+      dispose: vi.fn(),
+      reset: vi.fn(),
+      write: mocks.terminalWrite,
+      options: { disableStdin: true },
+    }) as unknown as Terminal)
+    vi.mocked(FitAddon).mockImplementation(() => ({
+      fit: vi.fn(),
+    }) as unknown as FitAddon)
     mocks.keyHandler = undefined
     mocks.poll = undefined
+    mocks.controlMode = 'amplifier_bound'
     Object.defineProperty(document, 'visibilityState', {
       configurable: true,
       value: 'visible',
@@ -91,7 +113,13 @@ describe('ExistingPaneView adaptive polling integration', () => {
 
   it('wakes capture only for trusted accepted input and never synthesizes local echo', async () => {
     const view = render(
-      <ExistingPaneView sessionId="session-1" focused={true} hidden={false} />,
+      <ExistingPaneView
+        sessionId="session-1"
+        tabId="tab-1"
+        focused={true}
+        hidden={false}
+        focusActivation={1}
+      />,
     )
     await act(async () => {
       await Promise.resolve()
@@ -114,6 +142,16 @@ describe('ExistingPaneView adaptive polling integration', () => {
     expect(mocks.inputEnqueue).toHaveBeenCalledWith('x')
     expect(mocks.pollerWake).toHaveBeenCalledTimes(1)
     expect(mocks.terminalWrite).toHaveBeenCalledTimes(writesBeforeInput)
+
+    mocks.controlMode = 'shell_continuation'
+    await act(async () => {
+      await mocks.poll?.()
+    })
+    expect(view.getByText('shell · Amplifier exited')).toBeInTheDocument()
+    act(() => {
+      mocks.keyHandler?.({ key: 'y', domEvent: { isTrusted: true } })
+    })
+    expect(mocks.inputEnqueue).toHaveBeenCalledWith('y')
 
     view.unmount()
     expect(mocks.pollerStop).toHaveBeenCalled()

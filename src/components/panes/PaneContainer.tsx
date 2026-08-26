@@ -216,6 +216,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const focusActivation = useAppSelector((s) => (
+    s.tabs.focusActivation?.tabId === tabId
+      ? s.tabs.focusActivation.token
+      : 0
+  ))
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
   const paneTitleSetByUser = useAppSelector((s) => s.panes.paneTitleSetByUser?.[tabId] ?? EMPTY_PANE_TITLE_SET_BY_USER)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
@@ -572,6 +577,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           isOnlyPane,
           hidden,
           activePane === node.id,
+          focusActivation,
         )}
       </Pane>
     )
@@ -844,6 +850,7 @@ function renderContent(
   isOnlyPane: boolean,
   hidden?: boolean,
   focused = false,
+  focusActivation = 0,
 ) {
   if (content.kind === 'terminal') {
     return (
@@ -936,6 +943,8 @@ function renderContent(
           cwd={content.cwd}
           hidden={hidden}
           focused={focused && !hidden}
+          tabId={tabId}
+          focusActivation={focusActivation}
         />
       </ErrorBoundary>
     )

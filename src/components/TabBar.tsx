@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
+import { activateTab, addTab, closeTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
@@ -328,7 +328,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           if (attentionDismiss === 'click') {
             dispatch(dismissTabGreen(tab.id))
           }
-          dispatch(setActiveTab(tab.id))
+          dispatch(activateTab(tab.id))
         }}
         onDoubleClick={() => {
           setRenamingId(tab.id)

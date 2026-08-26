@@ -17,11 +17,12 @@ import {
   createAdaptiveExistingPanePoller,
   type AdaptiveExistingPanePoller,
 } from '@/lib/existing-pane-polling'
+import type { ConcernPaneControlMode } from '@shared/concern-os-contract'
 
 type ViewState =
   | { kind: 'loading'; message: string }
   | { kind: 'historical'; message: string }
-  | { kind: 'live'; paneId: string }
+  | { kind: 'live'; paneId: string; controlMode: ConcernPaneControlMode }
   | { kind: 'ended'; message: string }
   | { kind: 'error'; message: string }
 
@@ -34,7 +35,10 @@ const EXISTING_PANE_FOCUS_OWNER_SELECTOR = [
   'input',
   'textarea',
   'select',
+  'button',
   '[contenteditable="true"]',
+  '[role="button"]',
+  '[role="tab"]',
   '[role="textbox"]',
   '[role="searchbox"]',
   '[role="combobox"]',
@@ -43,6 +47,8 @@ const EXISTING_PANE_FOCUS_OWNER_SELECTOR = [
   '[role="menu"]',
   '[role="menuitem"]',
   '[role="listbox"]',
+  '[role="toolbar"]',
+  '[role="toolbar"] *',
 ].join(',')
 
 const EXISTING_PANE_OPEN_OVERLAY_SELECTOR = [
@@ -53,29 +59,58 @@ const EXISTING_PANE_OPEN_OVERLAY_SELECTOR = [
   '[role="listbox"]',
 ].join(',')
 
-function canAutoFocusExistingPane(host: HTMLElement): boolean {
+function isMatchingActivationOwner(
+  activeElement: HTMLElement,
+  host: HTMLElement,
+  sessionId: string,
+  tabId: string,
+): boolean {
+  if (host.contains(activeElement)) return true
+  if (activeElement.closest('[data-existing-pane-terminal-host="true"]')) return true
+
+  // Browser focus lands on the activating sidebar button or tab itself. Do
+  // not use closest() here: pane toolbars live beneath data-tab-id wrappers,
+  // and treating an ancestor as intent would let unrelated controls lose
+  // focus on a later render.
+  return activeElement.dataset.sessionId === sessionId
+    || activeElement.dataset.tabId === tabId
+}
+
+function canAutoFocusExistingPane(
+  host: HTMLElement,
+  sessionId: string,
+  tabId: string,
+): boolean {
   const activeElement = document.activeElement
   if (document.querySelector(EXISTING_PANE_OPEN_OVERLAY_SELECTOR)) return false
-  if (activeElement && host.contains(activeElement)) return true
   if (!activeElement || activeElement === document.body || activeElement === document.documentElement) {
     return true
   }
 
-  return !activeElement.closest(EXISTING_PANE_FOCUS_OWNER_SELECTOR)
+  if (!(activeElement instanceof HTMLElement)) return false
+  if (isMatchingActivationOwner(activeElement, host, sessionId, tabId)) return true
+  if (activeElement.closest(EXISTING_PANE_FOCUS_OWNER_SELECTOR)) {
+    return false
+  }
+  return false
 }
 
 export function ExistingPaneView({
   sessionId,
+  tabId,
   title,
   cwd,
   hidden,
   focused,
+  focusActivation,
 }: {
   sessionId: string
+  tabId: string
   title?: string
   cwd?: string
   hidden?: boolean
   focused: boolean
+  focusActivation: number
 }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal>()
@@ -90,6 +125,8 @@ export function ExistingPaneView({
   const paneFocusedRef = useRef(focused)
   const hiddenRef = useRef(!!hidden)
   const browserFocusedRef = useRef(false)
+  const focusActivationRef = useRef(focusActivation)
+  const handledFocusActivationRef = useRef(0)
   const [state, setState] = useState<ViewState>({
     kind: 'loading',
     message: 'Checking live tmux ownership…',
@@ -104,6 +141,7 @@ export function ExistingPaneView({
   paneFocusedRef.current = focused
   hiddenRef.current = !!hidden
   browserFocusedRef.current = browserFocused
+  focusActivationRef.current = focusActivation
 
   inputHandlerRef.current = (data) => {
     const host = hostRef.current
@@ -205,19 +243,23 @@ export function ExistingPaneView({
   }, [browserFocused, focused, hidden, state.kind])
 
   useEffect(() => {
-    if (
-      state.kind !== 'live'
-      || !focused
-      || !browserFocused
-      || hidden
-      || inputFailedRef.current
-    ) {
-      return
-    }
+    if (focusActivation <= handledFocusActivationRef.current || state.kind !== 'live') return
+
+    // Consume each explicit activation exactly once. A blocked attempt must not
+    // become a delayed focus steal after an unrelated render or control closes.
+    handledFocusActivationRef.current = focusActivation
+    if (!focused || !browserFocused || hidden || inputFailedRef.current) return
 
     const host = hostRef.current
     const terminal = terminalRef.current
-    if (!host || !terminal || !canAutoFocusExistingPane(host)) return
+    if (
+      !host
+      || !terminal
+      || terminal.options.disableStdin
+      || !canAutoFocusExistingPane(host, sessionId, tabId)
+    ) {
+      return
+    }
 
     // The live state is established by the first validated capture. Wait one
     // frame so React has exposed the terminal host and xterm has rendered its
@@ -229,9 +271,11 @@ export function ExistingPaneView({
         || !browserFocusedRef.current
         || hiddenRef.current
         || inputFailedRef.current
+        || focusActivationRef.current !== focusActivation
+        || terminal.options.disableStdin
         || document.visibilityState !== 'visible'
         || !document.hasFocus()
-        || !canAutoFocusExistingPane(host)
+        || !canAutoFocusExistingPane(host, sessionId, tabId)
       ) {
         return
       }
@@ -239,7 +283,7 @@ export function ExistingPaneView({
     })
 
     return () => cancelAnimationFrame(frame)
-  }, [browserFocused, focused, hidden, sessionId, state.kind])
+  }, [focusActivation, state.kind, browserFocused, focused, hidden, sessionId, tabId])
 
   useEffect(() => {
     capturePollerRef.current?.refreshActivity()
@@ -275,6 +319,11 @@ export function ExistingPaneView({
           throw new Error('Existing-pane input acknowledgement sequence changed.')
         }
         nextInputSequenceRef.current = sequence + 1
+        if (response.control_mode === 'shell_continuation') {
+          setState((current) => current.kind === 'live'
+            ? { ...current, controlMode: response.control_mode }
+            : current)
+        }
       },
       (error) => {
         if (activeSessionIdRef.current !== sessionId || inputFailedRef.current) return
@@ -307,7 +356,11 @@ export function ExistingPaneView({
         terminalRef.current?.reset()
         terminalRef.current?.write(snapshot.data)
       }
-      setState({ kind: 'live', paneId: snapshot.pane_id })
+      setState({
+        kind: 'live',
+        paneId: snapshot.pane_id,
+        controlMode: snapshot.control_mode,
+      })
     }
 
     const capturePoller = createAdaptiveExistingPanePoller({
@@ -388,11 +441,14 @@ export function ExistingPaneView({
         ref={hostRef}
         className={terminalVisible ? 'h-full w-full p-2' : 'absolute h-px w-px overflow-hidden'}
         data-testid="existing-pane-terminal"
+        data-existing-pane-terminal-host="true"
       />
 
       {state.kind === 'live' && (
         <div className="pointer-events-none absolute right-3 top-3 rounded bg-black/75 px-2 py-1 text-xs text-slate-300">
-          tmux {state.paneId} · input only while focused
+          {state.controlMode === 'shell_continuation'
+            ? 'shell · Amplifier exited'
+            : `tmux ${state.paneId} · input only while focused`}
         </div>
       )}
 

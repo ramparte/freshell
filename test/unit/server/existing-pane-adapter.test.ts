@@ -49,6 +49,10 @@ function validStarts(pid: number): string {
   return statWithStartTicks(pid, starts.get(pid) ?? -1)
 }
 
+function processReadError(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(code), { code })
+}
+
 function defaultExec() {
   return vi.fn(async (_file: string, args: readonly string[]) => {
     if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
@@ -94,6 +98,7 @@ describe('ExistingPaneAdapter', () => {
       next_input_sequence: 1,
       input_lease: 'test-lease-token',
       lease_expires_at: 11_000,
+      control_mode: 'amplifier_bound',
     })
     expect(exec).toHaveBeenCalledTimes(3)
     expect(exec.mock.calls[1]?.[1]).toEqual([
@@ -135,7 +140,12 @@ describe('ExistingPaneAdapter', () => {
       liveSession.id,
       lease,
       { sequence: 1, data: 'é\u0003\r' },
-    )).resolves.toEqual({ ok: true, pane_id: '%5', sequence: 1 })
+    )).resolves.toEqual({
+      ok: true,
+      pane_id: '%5',
+      sequence: 1,
+      control_mode: 'amplifier_bound',
+    })
 
     expect(encodeTmuxHexBytes('é\u0003\r')).toEqual(['c3', 'a9', '03', '0d'])
     expect(inputTransactions(exec)).toHaveLength(1)
@@ -150,7 +160,7 @@ describe('ExistingPaneAdapter', () => {
     )
   })
 
-  it('uses the lease fast path: three proc reads and one atomic tmux transaction per batch', async () => {
+  it('revalidates all generations after the atomic tmux input transaction', async () => {
     const events: string[] = []
     const exec = vi.fn(async (_file: string, args: readonly string[]) => {
       if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
@@ -167,7 +177,11 @@ describe('ExistingPaneAdapter', () => {
 
     await adapter.sendInput(liveSession.id, lease, { sequence: 1, data: 'batched text' })
 
-    expect(events).toEqual(['proc:100', 'proc:200', 'proc:201', 'tmux:if-shell'])
+    expect(events).toEqual([
+      'proc:100', 'proc:200', 'proc:201',
+      'tmux:if-shell',
+      'proc:100', 'proc:200', 'proc:201',
+    ])
     expect(inputTransactions(exec)).toHaveLength(1)
   })
 
@@ -195,8 +209,8 @@ describe('ExistingPaneAdapter', () => {
     expect(inputTransactions(exec)).toHaveLength(1)
     releaseFirst()
     await expect(Promise.all([first, second])).resolves.toEqual([
-      { ok: true, pane_id: '%5', sequence: 1 },
-      { ok: true, pane_id: '%5', sequence: 2 },
+      { ok: true, pane_id: '%5', sequence: 1, control_mode: 'amplifier_bound' },
+      { ok: true, pane_id: '%5', sequence: 2, control_mode: 'amplifier_bound' },
     ])
     expect(inputTransactions(exec).map((call) => call[1][7])).toEqual([
       'send-keys -H -t %5 61',
@@ -241,7 +255,7 @@ describe('ExistingPaneAdapter', () => {
     expect(inputTransactions(exec)).toHaveLength(0)
   })
 
-  it('fails closed on an atomic tmux identity race and does not advance sequence', async () => {
+  it('revokes the lease on an atomic tmux identity race', async () => {
     let transactionCount = 0
     const exec = vi.fn(async (_file: string, args: readonly string[]) => {
       if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
@@ -260,8 +274,8 @@ describe('ExistingPaneAdapter', () => {
     )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
     await expect(adapter.sendInput(
       liveSession.id, lease, { sequence: 1, data: 'retry' },
-    )).resolves.toEqual({ ok: true, pane_id: '%5', sequence: 1 })
-    expect(inputTransactions(exec)).toHaveLength(2)
+    )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
+    expect(inputTransactions(exec)).toHaveLength(1)
   })
 
   it('expires disconnected leases and binds them to the canonical session', async () => {
@@ -314,6 +328,331 @@ describe('ExistingPaneAdapter', () => {
     )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
     expect(inputTransactions(exec)).toHaveLength(0)
     expect(exec.mock.calls.flatMap((call) => call[1])).not.toContain('kill-pane')
+  })
+
+  it.each(['ENOENT', 'ESRCH'])(
+    'rejects initial attachment when Amplifier is definitely gone with %s',
+    async (code) => {
+      const exec = defaultExec()
+      const adapter = createAdapter(exec, async (pid) => {
+        if (pid === identity.amplifier_pid) throw processReadError(code)
+        return validStarts(pid)
+      })
+
+      await expect(adapter.capture(liveSession)).rejects.toThrow(
+        'exited before a generation-bound pane lease could be issued',
+      )
+      expect(exec.mock.calls.map((call) => call[1][2])).toEqual(['display-message'])
+      await expect(adapter.captureWithLease(
+        liveSession.id,
+        'test-lease-token',
+      )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
+    },
+  )
+
+  it('transitions to shell continuation only after capture and post-capture revalidation', async () => {
+    let amplifierGone = false
+    let captureCount = 0
+    const exec = vi.fn(async (_file: string, args: readonly string[]) => {
+      if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
+      if (args[2] === 'capture-pane') {
+        captureCount += 1
+        if (captureCount === 2) amplifierGone = true
+        return { stdout: `capture ${captureCount}\n` }
+      }
+      return { stdout: '' }
+    }) as TestExec
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+
+    await expect(adapter.captureWithLease(liveSession.id, lease)).resolves.toMatchObject({
+      data: 'capture 2\n',
+      input_lease: lease,
+      control_mode: 'shell_continuation',
+      input_enabled: true,
+    })
+    await expect(adapter.captureWithLease(liveSession.id, lease)).resolves.toMatchObject({
+      data: 'capture 3\n',
+      input_lease: lease,
+      control_mode: 'shell_continuation',
+      input_enabled: true,
+    })
+  })
+
+  it('transitions to shell continuation only after input and post-input revalidation', async () => {
+    let amplifierGone = false
+    const exec = vi.fn(async (_file: string, args: readonly string[]) => {
+      if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
+      if (args[2] === 'capture-pane') return { stdout: 'output\n' }
+      if (args[2] === 'if-shell') {
+        amplifierGone = true
+        return { stdout: '' }
+      }
+      return { stdout: '' }
+    }) as TestExec
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+
+    await expect(adapter.sendInput(
+      liveSession.id,
+      lease,
+      { sequence: 1, data: 'x' },
+    )).resolves.toEqual({
+      ok: true,
+      pane_id: '%5',
+      sequence: 1,
+      control_mode: 'shell_continuation',
+    })
+    expect(inputTransactions(exec)).toHaveLength(1)
+  })
+
+  it('does not transition when the exact-pane operation fails after Amplifier exits', async () => {
+    let amplifierGone = false
+    let rejectCapture = false
+    const exec = vi.fn(async (_file: string, args: readonly string[]) => {
+      if (args[2] === 'display-message') return { stdout: '%5|200|100\n' }
+      if (args[2] === 'capture-pane') {
+        if (rejectCapture) throw new Error('capture failed')
+        return { stdout: 'output\n' }
+      }
+      return { stdout: '' }
+    }) as TestExec
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    amplifierGone = true
+    rejectCapture = true
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('could not be captured safely')
+    rejectCapture = false
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+  })
+
+  it('keeps input FIFO and replay sequence state across the shell transition', async () => {
+    let amplifierGone = false
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ESRCH')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+
+    await expect(adapter.sendInput(
+      liveSession.id, lease, { sequence: 1, data: 'a' },
+    )).resolves.toMatchObject({
+      sequence: 1,
+      control_mode: 'amplifier_bound',
+    })
+    amplifierGone = true
+    await expect(adapter.sendInput(
+      liveSession.id, lease, { sequence: 2, data: 'b' },
+    )).resolves.toMatchObject({
+      sequence: 2,
+      control_mode: 'shell_continuation',
+    })
+    await expect(adapter.sendInput(
+      liveSession.id, lease, { sequence: 2, data: 'replay' },
+    )).rejects.toBeInstanceOf(ExistingPaneInputError)
+    await expect(adapter.sendInput(
+      liveSession.id, lease, { sequence: 3, data: 'c' },
+    )).resolves.toMatchObject({
+      sequence: 3,
+      control_mode: 'shell_continuation',
+    })
+
+    expect(inputTransactions(exec).map((call) => call[1][7])).toEqual([
+      'send-keys -H -t %5 61',
+      'send-keys -H -t %5 62',
+      'send-keys -H -t %5 63',
+    ])
+  })
+
+  it.each([
+    ['PID reuse', async () => statWithStartTicks(identity.amplifier_pid, 31)],
+    ['malformed proc stat', async () => 'malformed'],
+    ['EACCES', async () => { throw processReadError('EACCES') }],
+    ['other I/O failure', async () => { throw processReadError('EIO') }],
+  ])('fails closed and revokes on uncertain Amplifier state: %s', async (_label, failedRead) => {
+    let fail = false
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && fail) return failedRead()
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    fail = true
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
+    fail = false
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+  })
+
+  it.each([
+    ['tmux server', identity.tmux_server_pid, 11],
+    ['pane process', identity.pane_pid, 21],
+  ])('revokes continuation when the %s generation changes', async (_label, stalePid, ticks) => {
+    let amplifierGone = false
+    let generationChanged = false
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      if (pid === stalePid && generationChanged) return statWithStartTicks(pid, ticks)
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    amplifierGone = true
+    await adapter.captureWithLease(liveSession.id, lease)
+    generationChanged = true
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
+    generationChanged = false
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+  })
+
+  it.each([
+    ['pane ID', '%6|200|100\n'],
+    ['pane PID', '%5|201|100\n'],
+    ['tmux server PID', '%5|200|101\n'],
+  ])('revokes continuation when the displayed %s changes', async (_label, changedIdentity) => {
+    let amplifierGone = false
+    let paneIdentity = '%5|200|100\n'
+    const exec = vi.fn(async (_file: string, args: readonly string[]) => {
+      if (args[2] === 'display-message') return { stdout: paneIdentity }
+      if (args[2] === 'capture-pane') return { stdout: 'output\n' }
+      return { stdout: '' }
+    }) as TestExec
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    amplifierGone = true
+    await adapter.captureWithLease(liveSession.id, lease)
+    paneIdentity = changedIdentity
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toBeInstanceOf(ExistingPaneIdentityError)
+    paneIdentity = '%5|200|100\n'
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+  })
+
+  it('revokes continuation if the exited Amplifier PID reappears or is reused', async () => {
+    let amplifierState: 'same' | 'gone' | 'reused' = 'same'
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid !== identity.amplifier_pid) return validStarts(pid)
+      if (amplifierState === 'gone') throw processReadError('ENOENT')
+      if (amplifierState === 'reused') return statWithStartTicks(pid, 31)
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    amplifierState = 'gone'
+    await adapter.captureWithLease(liveSession.id, lease)
+    amplifierState = 'reused'
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('Amplifier process generation changed')
+  })
+
+  it('does not reacquire an expired continuation lease after Amplifier exits', async () => {
+    let now = 1_000
+    let amplifierGone = false
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    }, { now: () => now, leaseTtlMs: 100 })
+    const lease = await issueLease(adapter)
+    amplifierGone = true
+    await adapter.captureWithLease(liveSession.id, lease)
+    now = 1_201
+
+    await expect(adapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+    await expect(adapter.capture(liveSession)).rejects.toThrow(
+      'exited before a generation-bound pane lease could be issued',
+    )
+  })
+
+  it('does not reacquire shell continuation after an adapter restart', async () => {
+    let amplifierGone = false
+    const exec = defaultExec()
+    const readProcessStat = async (pid: number) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    }
+    const originalAdapter = createAdapter(exec, readProcessStat)
+    const lease = await issueLease(originalAdapter)
+    amplifierGone = true
+    await originalAdapter.captureWithLease(liveSession.id, lease)
+
+    const restartedAdapter = createAdapter(exec, readProcessStat)
+    await expect(restartedAdapter.captureWithLease(
+      liveSession.id,
+      lease,
+    )).rejects.toThrow('lease expired or does not match')
+    await expect(restartedAdapter.capture(liveSession)).rejects.toThrow(
+      'exited before a generation-bound pane lease could be issued',
+    )
+  })
+
+  it('uses only exact-pane inspection, capture, and input commands during continuation', async () => {
+    let amplifierGone = false
+    const exec = defaultExec()
+    const adapter = createAdapter(exec, async (pid) => {
+      if (pid === identity.amplifier_pid && amplifierGone) throw processReadError('ENOENT')
+      return validStarts(pid)
+    })
+    const lease = await issueLease(adapter)
+    amplifierGone = true
+    await adapter.captureWithLease(liveSession.id, lease)
+    await adapter.sendInput(liveSession.id, lease, { sequence: 1, data: 'x' })
+
+    const calls = JSON.stringify(exec.mock.calls)
+    expect(calls).not.toMatch(
+      /new-session|new-window|split-window|respawn-pane|kill-pane|kill-session|resize-pane|run-shell|attach-session|switch-client|amplifier|resume/,
+    )
+    expect(new Set(exec.mock.calls.map((call) => call[1][2]))).toEqual(
+      new Set(['display-message', 'capture-pane', 'if-shell']),
+    )
+    expect(exec.mock.calls.every((call) => (
+      call[1][0] === '-S' && call[1][1] === TEST_TMUX_SOCKET
+    ))).toBe(true)
   })
 
   it('rejects historical sessions before capture', async () => {

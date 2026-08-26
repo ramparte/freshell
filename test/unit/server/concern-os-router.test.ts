@@ -57,6 +57,7 @@ function appWith(overrides: Partial<AdapterMethods> = {}) {
       next_input_sequence: 1,
       input_lease: 'lease-1',
       lease_expires_at: 1_000,
+      control_mode: 'amplifier_bound' as const,
     })),
     captureWithLease: vi.fn(async () => ({
       ok: true as const,
@@ -66,11 +67,13 @@ function appWith(overrides: Partial<AdapterMethods> = {}) {
       next_input_sequence: 1,
       input_lease: 'lease-1',
       lease_expires_at: 1_000,
+      control_mode: 'shell_continuation' as const,
     })),
     sendInput: vi.fn(async () => ({
       ok: true as const,
       pane_id: '%5' as const,
       sequence: 1,
+      control_mode: 'shell_continuation' as const,
     })),
     ...overrides,
   } as unknown as ExistingPaneAdapter
@@ -120,6 +123,7 @@ describe('Concern OS pane routes', () => {
       next_input_sequence: 1,
       input_lease: 'lease-1',
       lease_expires_at: 1_000,
+      control_mode: 'amplifier_bound',
     })
     expect(client.getSession).toHaveBeenCalledWith('session-1')
     expect(adapter.capture).toHaveBeenCalledWith(expect.objectContaining({ session_id: 'session-1' }))
@@ -136,6 +140,7 @@ describe('Concern OS pane routes', () => {
     expect(client.getSession).not.toHaveBeenCalled()
     expect(adapter.capture).not.toHaveBeenCalled()
     expect(adapter.captureWithLease).toHaveBeenCalledWith('session-1', 'lease-1')
+    expect(response.body.control_mode).toBe('shell_continuation')
   })
 
   it('rejects capture when the upstream canonical key does not match the requested session', async () => {
@@ -189,7 +194,12 @@ describe('Concern OS pane routes', () => {
       _sessionId: string,
       _lease: string,
       input: { sequence: number; data: string },
-    ) => ({ ok: true as const, pane_id: '%5' as const, sequence: input.sequence }))
+    ) => ({
+      ok: true as const,
+      pane_id: '%5' as const,
+      sequence: input.sequence,
+      control_mode: 'shell_continuation' as const,
+    }))
     const { app, client } = appWith({ sendInput })
 
     const response = await request(app)
@@ -198,7 +208,12 @@ describe('Concern OS pane routes', () => {
       .send({ sequence: 1, data: 'hello' })
 
     expect(response.status).toBe(200)
-    expect(response.body).toEqual({ ok: true, pane_id: '%5', sequence: 1 })
+    expect(response.body).toEqual({
+      ok: true,
+      pane_id: '%5',
+      sequence: 1,
+      control_mode: 'shell_continuation',
+    })
     expect(client.getSession).not.toHaveBeenCalled()
     expect(sendInput).toHaveBeenCalledWith(
       'session-1',
@@ -260,6 +275,23 @@ describe('Concern OS pane routes', () => {
 
     expect(response.status).toBe(409)
     expect(response.body).toEqual({ ok: false, error: 'pane generation changed' })
+  })
+
+  it('never falls back to catalog reacquisition when a continuation lease fails', async () => {
+    const captureWithLease = vi.fn(async () => {
+      throw new ExistingPaneIdentityError('continuation lease expired')
+    })
+    const { app, client, adapter } = appWith({ captureWithLease })
+
+    const response = await request(app)
+      .get('/api/concern-os/sessions/session-1/pane')
+      .set('x-concern-pane-lease', 'expired-continuation-lease')
+
+    expect(response.status).toBe(409)
+    expect(response.body).toEqual({ ok: false, error: 'continuation lease expired' })
+    expect(client.getSession).not.toHaveBeenCalled()
+    expect(adapter.capture).not.toHaveBeenCalled()
+    expect(captureWithLease).toHaveBeenCalledOnce()
   })
 
   it('authenticates pane I/O before consuming its dedicated rate limit', async () => {

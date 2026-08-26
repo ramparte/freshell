@@ -6,6 +6,7 @@ import type {
   ConcernLiveIdentity,
   ConcernPaneInputRequest,
   ConcernPaneInputResponse,
+  ConcernPaneControlMode,
   ConcernPaneSnapshot,
   ConcernSession,
 } from '../shared/concern-os-contract.js'
@@ -40,7 +41,10 @@ type ExistingPaneLease = {
   sessionId: string
   identity: ConcernLiveIdentity
   expiresAt: number
+  controlMode: ConcernPaneControlMode
 }
+
+type AmplifierGenerationState = 'same' | 'definitely_gone'
 
 export class ExistingPaneIdentityError extends Error {
   constructor(message: string) {
@@ -103,7 +107,7 @@ export class ExistingPaneAdapter {
 
   async capture(session: ConcernSession): Promise<ConcernPaneSnapshot> {
     const identity = this.requireIdentity(session)
-    const data = await this.captureIdentity(identity)
+    const data = await this.captureInitialIdentity(identity)
     const lease = this.issueLease(session.id, identity)
 
     return this.snapshot(identity, data, lease)
@@ -114,28 +118,55 @@ export class ExistingPaneAdapter {
     leaseToken: string,
   ): Promise<ConcernPaneSnapshot> {
     const lease = this.requireLease(requestedSessionId, leaseToken)
-    const data = await this.captureIdentity(lease.identity)
-    // A successful full identity validation renews the short lease. Polling is
-    // therefore the heartbeat; closing the browser lets write authority expire.
-    lease.expiresAt = this.now() + this.leaseTtlMs
-    return this.snapshot(lease.identity, data, { token: leaseToken, ...lease })
+    try {
+      const { data, controlMode } = await this.captureLeasedIdentity(lease)
+      lease.controlMode = this.mergeControlMode(lease.controlMode, controlMode)
+      // A successful full identity validation renews the short lease. Polling is
+      // therefore the heartbeat; closing the browser lets write authority expire.
+      lease.expiresAt = this.now() + this.leaseTtlMs
+      return this.snapshot(lease.identity, data, { token: leaseToken, ...lease })
+    } catch (error) {
+      this.revokeLeaseOnIdentityFailure(leaseToken, error)
+      throw error
+    }
   }
 
-  private async captureIdentity(identity: ConcernLiveIdentity): Promise<string> {
-    await this.validate(identity)
-    const { stdout } = await this.run('tmux', this.tmuxArgs([
-      'capture-pane',
-      '-p',
-      '-e',
-      '-J',
-      '-t',
-      identity.pane_id,
-      '-S',
-      `-${CAPTURE_HISTORY_LINES}`,
-    ]), { encoding: 'utf8', maxBuffer: MAX_CAPTURE_BYTES })
-    // Validate again so output cannot be returned across a pane/PID generation race.
-    await this.validate(identity)
-    return stdout
+  private async captureInitialIdentity(identity: ConcernLiveIdentity): Promise<string> {
+    await this.validateInitialIdentity(identity)
+    const data = await this.captureExactPane(identity)
+    await this.validateInitialIdentity(identity)
+    return data
+  }
+
+  private async captureLeasedIdentity(
+    lease: ExistingPaneLease,
+  ): Promise<{ data: string; controlMode: ConcernPaneControlMode }> {
+    const operationMode = lease.controlMode
+    const before = await this.validateLeasedIdentity(lease)
+    const data = await this.captureExactPane(lease.identity)
+    const after = await this.validateLeasedIdentity(lease)
+    return {
+      data,
+      controlMode: this.resolveControlModeAfterOperation(operationMode, before, after),
+    }
+  }
+
+  private async captureExactPane(identity: ConcernLiveIdentity): Promise<string> {
+    try {
+      const { stdout } = await this.run('tmux', this.tmuxArgs([
+        'capture-pane',
+        '-p',
+        '-e',
+        '-J',
+        '-t',
+        identity.pane_id,
+        '-S',
+        `-${CAPTURE_HISTORY_LINES}`,
+      ]), { encoding: 'utf8', maxBuffer: MAX_CAPTURE_BYTES })
+      return stdout
+    } catch {
+      throw new ExistingPaneIdentityError('The exact tmux pane could not be captured safely.')
+    }
   }
 
   private snapshot(
@@ -151,6 +182,7 @@ export class ExistingPaneAdapter {
       next_input_sequence: this.nextSequence(identity),
       input_lease: lease.token,
       lease_expires_at: lease.expiresAt,
+      control_mode: lease.controlMode,
     }
   }
 
@@ -188,14 +220,31 @@ export class ExistingPaneAdapter {
       // then checks its own server/pane identity and sends the bytes as one
       // command-queue operation, so another tmux client cannot replace the
       // target between a display-message check and send-keys.
-      await this.validateProcessGenerations(currentIdentity)
-      await this.sendAtomicallyIfIdentityMatches(currentIdentity, bytes)
-      this.lastSequences.set(sequenceKey, input.sequence)
+      try {
+        const operationMode = currentLease.controlMode
+        const before = await this.validateLeasedIdentity(currentLease)
+        await this.sendAtomicallyIfIdentityMatches(currentIdentity, bytes)
+        const after = await this.validateLeasedIdentity(currentLease)
+        const operationResultMode = this.resolveControlModeAfterOperation(
+          operationMode,
+          before,
+          after,
+        )
+        currentLease.controlMode = this.mergeControlMode(
+          currentLease.controlMode,
+          operationResultMode,
+        )
+        this.lastSequences.set(sequenceKey, input.sequence)
 
-      return {
-        ok: true,
-        pane_id: currentIdentity.pane_id,
-        sequence: input.sequence,
+        return {
+          ok: true,
+          pane_id: currentIdentity.pane_id,
+          sequence: input.sequence,
+          control_mode: currentLease.controlMode,
+        }
+      } catch (error) {
+        this.revokeLeaseOnIdentityFailure(leaseToken, error)
+        throw error
       }
     })
   }
@@ -213,6 +262,7 @@ export class ExistingPaneAdapter {
       sessionId: this.canonicalSessionId(sessionId),
       identity: structuredClone(identity),
       expiresAt: now + this.leaseTtlMs,
+      controlMode: 'amplifier_bound' as const,
     }
     this.leases.set(token, lease)
     return { token, ...lease }
@@ -298,14 +348,36 @@ export class ExistingPaneAdapter {
     }
   }
 
-  private async validate(identity: ConcernLiveIdentity): Promise<void> {
-    const { stdout } = await this.run('tmux', this.tmuxArgs([
-      'display-message',
-      '-p',
-      '-t',
-      identity.pane_id,
-      TMUX_IDENTITY_FORMAT,
-    ]), { encoding: 'utf8', maxBuffer: 16 * 1024 })
+  private async validateInitialIdentity(identity: ConcernLiveIdentity): Promise<void> {
+    await this.validateStablePaneIdentity(identity)
+    const amplifierState = await this.classifyAmplifierGeneration(identity)
+    if (amplifierState !== 'same') {
+      throw new ExistingPaneIdentityError(
+        'The Amplifier process exited before a generation-bound pane lease could be issued.',
+      )
+    }
+  }
+
+  private async validateLeasedIdentity(
+    lease: ExistingPaneLease,
+  ): Promise<AmplifierGenerationState> {
+    await this.validateStablePaneIdentity(lease.identity)
+    return this.classifyAmplifierGeneration(lease.identity)
+  }
+
+  private async validateStablePaneIdentity(identity: ConcernLiveIdentity): Promise<void> {
+    let stdout: string
+    try {
+      ({ stdout } = await this.run('tmux', this.tmuxArgs([
+        'display-message',
+        '-p',
+        '-t',
+        identity.pane_id,
+        TMUX_IDENTITY_FORMAT,
+      ]), { encoding: 'utf8', maxBuffer: 16 * 1024 }))
+    } catch {
+      throw new ExistingPaneIdentityError('The exact tmux pane identity could not be verified.')
+    }
     const identityFields = stdout.trim().split('|')
     const [paneId, panePidRaw, serverPidRaw] = identityFields
     if (
@@ -317,10 +389,6 @@ export class ExistingPaneAdapter {
       throw new ExistingPaneIdentityError('The tmux pane no longer matches its catalog identity.')
     }
 
-    await this.validateProcessGenerations(identity)
-  }
-
-  private async validateProcessGenerations(identity: ConcernLiveIdentity): Promise<void> {
     await Promise.all([
       this.assertGeneration(
         identity.tmux_server_pid,
@@ -328,12 +396,63 @@ export class ExistingPaneAdapter {
         'tmux server',
       ),
       this.assertGeneration(identity.pane_pid, identity.pane_start_ticks, 'pane process'),
-      this.assertGeneration(
-        identity.amplifier_pid,
-        identity.amplifier_start_ticks,
-        'Amplifier process',
-      ),
     ])
+  }
+
+  private async classifyAmplifierGeneration(
+    identity: ConcernLiveIdentity,
+  ): Promise<AmplifierGenerationState> {
+    let stat: string
+    try {
+      stat = await this.readStat(identity.amplifier_pid)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code
+      if (code === 'ENOENT' || code === 'ESRCH') return 'definitely_gone'
+      throw new ExistingPaneIdentityError(
+        'The Amplifier process generation could not be verified safely.',
+      )
+    }
+
+    const actualTicks = processStartTicks(stat)
+    if (actualTicks === undefined) {
+      throw new ExistingPaneIdentityError(
+        'The Amplifier process generation could not be verified safely.',
+      )
+    }
+    if (actualTicks !== identity.amplifier_start_ticks) {
+      throw new ExistingPaneIdentityError('The Amplifier process generation changed.')
+    }
+    return 'same'
+  }
+
+  private resolveControlModeAfterOperation(
+    currentMode: ConcernPaneControlMode,
+    before: AmplifierGenerationState,
+    after: AmplifierGenerationState,
+  ): ConcernPaneControlMode {
+    if (currentMode === 'shell_continuation') {
+      if (before !== 'definitely_gone' || after !== 'definitely_gone') {
+        throw new ExistingPaneIdentityError(
+          'The exited Amplifier process identity unexpectedly reappeared.',
+        )
+      }
+      return currentMode
+    }
+    if (before === 'definitely_gone' && after === 'same') {
+      throw new ExistingPaneIdentityError(
+        'The Amplifier process generation changed while the pane operation was in flight.',
+      )
+    }
+    return after === 'definitely_gone' ? 'shell_continuation' : 'amplifier_bound'
+  }
+
+  private mergeControlMode(
+    currentMode: ConcernPaneControlMode,
+    operationResultMode: ConcernPaneControlMode,
+  ): ConcernPaneControlMode {
+    return currentMode === 'shell_continuation' || operationResultMode === 'shell_continuation'
+      ? 'shell_continuation'
+      : 'amplifier_bound'
   }
 
   private async sendAtomicallyIfIdentityMatches(
@@ -362,15 +481,23 @@ export class ExistingPaneAdapter {
       identity.pane_id,
       TMUX_IDENTITY_MISMATCH_MARKER,
     ].join(' ')
-    const { stdout, stderr } = await this.run('tmux', this.tmuxArgs([
-      'if-shell',
-      '-F',
-      '-t',
-      identity.pane_id,
-      predicate,
-      sendCommand,
-      rejectCommand,
-    ]), { encoding: 'utf8', maxBuffer: 16 * 1024 })
+    let stdout: string
+    let stderr: string | undefined
+    try {
+      ({ stdout, stderr } = await this.run('tmux', this.tmuxArgs([
+        'if-shell',
+        '-F',
+        '-t',
+        identity.pane_id,
+        predicate,
+        sendCommand,
+        rejectCommand,
+      ]), { encoding: 'utf8', maxBuffer: 16 * 1024 }))
+    } catch {
+      throw new ExistingPaneIdentityError(
+        'The exact tmux pane input transaction could not be verified.',
+      )
+    }
 
     // send-keys has no output. The false branch emits the marker, and any
     // other output is also rejected rather than treating an ambiguous tmux
@@ -396,5 +523,9 @@ export class ExistingPaneAdapter {
     if (actualTicks !== expectedTicks) {
       throw new ExistingPaneIdentityError(`The ${label} generation changed.`)
     }
+  }
+
+  private revokeLeaseOnIdentityFailure(leaseToken: string, error: unknown): void {
+    if (error instanceof ExistingPaneIdentityError) this.leases.delete(leaseToken)
   }
 }

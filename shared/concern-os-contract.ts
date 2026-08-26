@@ -22,6 +22,11 @@ export const ConcernLiveIdentitySchema = z.object({
   amplifier_start_ticks: z.number().int().nonnegative(),
 }).passthrough()
 
+export const ConcernPaneControlModeSchema = z.enum([
+  'amplifier_bound',
+  'shell_continuation',
+])
+
 export const ConcernResolvableAttachmentSchema = z.object({
   state: z.literal('resolvable'),
   pane_id: TmuxPaneIdSchema,
@@ -74,6 +79,7 @@ export const ConcernPaneSnapshotSchema = z.object({
   next_input_sequence: z.number().int().positive(),
   input_lease: NonEmptyString,
   lease_expires_at: z.number().int().positive(),
+  control_mode: ConcernPaneControlModeSchema,
 }).passthrough()
 
 export const ConcernPaneInputRequestSchema = z.object({
@@ -85,10 +91,12 @@ export const ConcernPaneInputResponseSchema = z.object({
   ok: z.literal(true),
   pane_id: TmuxPaneIdSchema,
   sequence: z.number().int().positive(),
+  control_mode: ConcernPaneControlModeSchema,
 }).strict()
 
 export type ConcernAttention = z.infer<typeof ConcernAttentionSchema>
 export type ConcernLiveIdentity = z.infer<typeof ConcernLiveIdentitySchema>
+export type ConcernPaneControlMode = z.infer<typeof ConcernPaneControlModeSchema>
 export type ConcernResolvableAttachment = z.infer<typeof ConcernResolvableAttachmentSchema>
 export type ConcernAttachment = z.infer<typeof ConcernAttachmentSchema>
 export type ConcernSession = z.infer<typeof ConcernSessionSchema>
