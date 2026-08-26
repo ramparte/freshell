@@ -8,7 +8,6 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
-import rateLimit from 'express-rate-limit'
 import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
@@ -77,7 +76,11 @@ import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { createHealthRouter } from './health-router.js'
 import { ConcernOsClient } from './concern-os-client.js'
-import { createConcernOsRouter } from './concern-os-router.js'
+import {
+  createConcernOsRouter,
+  createExistingPaneIoRateLimitMiddleware,
+  createGlobalApiRateLimitMiddleware,
+} from './concern-os-router.js'
 import { assertGenericTerminalCreationAllowed } from './existing-panes-policy.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
@@ -197,19 +200,14 @@ async function main() {
   // semantic metadata: sessionType, provider, threadIdHash).
   app.use('/api/fresh-agent/threads', createFreshAgentSnapshotRateLimitMiddleware())
 
-  // Basic rate limiting for /api
-  app.use(
-    '/api',
-    rateLimit({
-      windowMs: 60_000,
-      max: 300,
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  )
+  // Existing-pane capture/input have a dedicated post-auth budget because
+  // focused polling alone is intentionally more frequent than the general
+  // API budget. Every other API route keeps the existing global limiter.
+  app.use('/api', createGlobalApiRateLimitMiddleware())
 
   app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
+  app.use('/api', createExistingPaneIoRateLimitMiddleware())
   const concernOsClient = new ConcernOsClient()
   app.use('/api', createConcernOsRouter(concernOsClient))
   // Shell bootstrap route: returns shell-critical first-paint data only

@@ -1,4 +1,5 @@
-import { Router } from 'express'
+import { Router, type Request, type RequestHandler } from 'express'
+import rateLimit from 'express-rate-limit'
 import type { ConcernOsClient } from './concern-os-client.js'
 import {
   ExistingPaneAdapter,
@@ -10,6 +11,51 @@ import {
   MAX_CONCERN_PANE_INPUT_BYTES,
   type ConcernSession,
 } from '../shared/concern-os-contract.js'
+
+export const GLOBAL_API_RATE_LIMIT_MAX = 300
+export const EXISTING_PANE_IO_RATE_LIMIT_MAX = 4_800
+export const API_RATE_LIMIT_WINDOW_MS = 60_000
+
+const EXISTING_PANE_CAPTURE_PATH = /^\/concern-os\/sessions\/[^/]+\/pane$/
+const EXISTING_PANE_INPUT_PATH = /^\/concern-os\/sessions\/[^/]+\/pane\/input$/
+
+export function isExistingPaneIoRequest(
+  req: Pick<Request, 'method' | 'path'>,
+): boolean {
+  const path = req.path.startsWith('/api/')
+    ? req.path.slice('/api'.length)
+    : req.path
+  return (
+    (req.method === 'GET' && EXISTING_PANE_CAPTURE_PATH.test(path))
+    || (req.method === 'POST' && EXISTING_PANE_INPUT_PATH.test(path))
+  )
+}
+
+export function createGlobalApiRateLimitMiddleware(
+  max = GLOBAL_API_RATE_LIMIT_MAX,
+  windowMs = API_RATE_LIMIT_WINDOW_MS,
+): RequestHandler {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: isExistingPaneIoRequest,
+  })
+}
+
+export function createExistingPaneIoRateLimitMiddleware(
+  max = EXISTING_PANE_IO_RATE_LIMIT_MAX,
+  windowMs = API_RATE_LIMIT_WINDOW_MS,
+): RequestHandler {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => !isExistingPaneIoRequest(req),
+  })
+}
 
 function assertRequestedSession(
   requestedSession: string,

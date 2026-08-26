@@ -21,6 +21,9 @@ type ViewState =
   | { kind: 'ended'; message: string }
   | { kind: 'error'; message: string }
 
+export const EXISTING_PANE_FOCUSED_POLL_MS = 250
+export const EXISTING_PANE_BACKGROUND_POLL_MS = 750
+
 export function ExistingPaneView({
   sessionId,
   title,
@@ -226,7 +229,10 @@ export function ExistingPaneView({
         const interactive = paneFocusedRef.current
           && browserFocusedRef.current
           && !hiddenRef.current
-        timer = setTimeout(pollPane, interactive ? 100 : 750)
+        timer = setTimeout(
+          pollPane,
+          interactive ? EXISTING_PANE_FOCUSED_POLL_MS : EXISTING_PANE_BACKGROUND_POLL_MS,
+        )
       } catch (error) {
         if (!cancelled) {
           setState({

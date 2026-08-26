@@ -1,8 +1,13 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
-import { createConcernOsRouter } from '../../../server/concern-os-router.js'
+import {
+  createConcernOsRouter,
+  createExistingPaneIoRateLimitMiddleware,
+  createGlobalApiRateLimitMiddleware,
+} from '../../../server/concern-os-router.js'
+import { httpAuthMiddleware } from '../../../server/auth.js'
 import {
   ExistingPaneIdentityError,
   ExistingPaneInputError,
@@ -75,7 +80,32 @@ function appWith(overrides: Partial<AdapterMethods> = {}) {
   return { app, client, adapter }
 }
 
+function limitedAppWith(globalMax: number, existingPaneMax: number) {
+  const { client, adapter } = appWith()
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createGlobalApiRateLimitMiddleware(globalMax))
+  app.use('/api', httpAuthMiddleware)
+  app.use('/api', createExistingPaneIoRateLimitMiddleware(existingPaneMax))
+  app.use('/api', createConcernOsRouter(client, adapter))
+  app.get('/api/other', (_req, res) => res.json({ ok: true }))
+  return { app, client, adapter }
+}
+
 describe('Concern OS pane routes', () => {
+  const authToken = 'test-token-with-at-least-16-characters'
+  let previousAuthToken: string | undefined
+
+  beforeEach(() => {
+    previousAuthToken = process.env.AUTH_TOKEN
+    process.env.AUTH_TOKEN = authToken
+  })
+
+  afterEach(() => {
+    if (previousAuthToken === undefined) delete process.env.AUTH_TOKEN
+    else process.env.AUTH_TOKEN = previousAuthToken
+  })
+
   it('returns only the adapter generation-validated snapshot and next input sequence', async () => {
     const { app, client, adapter } = appWith()
 
@@ -230,5 +260,41 @@ describe('Concern OS pane routes', () => {
 
     expect(response.status).toBe(409)
     expect(response.body).toEqual({ ok: false, error: 'pane generation changed' })
+  })
+
+  it('authenticates pane I/O before consuming its dedicated rate limit', async () => {
+    const { app } = limitedAppWith(1, 2)
+    const path = '/api/concern-os/sessions/session-1/pane'
+
+    const unauthorized = await request(app).get(path)
+    const first = await request(app).get(path).set('x-auth-token', authToken)
+    const second = await request(app).get(path).set('x-auth-token', authToken)
+    const limited = await request(app).get(path).set('x-auth-token', authToken)
+
+    expect(unauthorized.status).toBe(401)
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(limited.status).toBe(429)
+  })
+
+  it('keeps exact pane I/O out of the global budget while limiting other API traffic', async () => {
+    const { app } = limitedAppWith(1, 4)
+    const token = { 'x-auth-token': authToken }
+
+    const capture = await request(app)
+      .get('/api/concern-os/sessions/session-1/pane')
+      .set(token)
+    const input = await request(app)
+      .post('/api/concern-os/sessions/session-1/pane/input')
+      .set(token)
+      .set('x-concern-pane-lease', 'lease-1')
+      .send({ sequence: 1, data: 'x' })
+    const firstOther = await request(app).get('/api/other').set(token)
+    const limitedOther = await request(app).get('/api/other').set(token)
+
+    expect(capture.status).toBe(200)
+    expect(input.status).toBe(200)
+    expect(firstOther.status).toBe(200)
+    expect(limitedOther.status).toBe(429)
   })
 })

@@ -66,7 +66,7 @@ describe('existing-pane browser input policy', () => {
     vi.useRealTimers()
   })
 
-  it('flushes controls immediately and serializes later batches behind the first', async () => {
+  it('coalesces frame batches behind one unresolved request into one successor', async () => {
     vi.useFakeTimers()
     const sent: string[] = []
     let releaseFirst!: () => void
@@ -81,48 +81,88 @@ describe('existing-pane browser input policy', () => {
     )
 
     batcher.enqueue('abc')
-    batcher.enqueue('\r')
-    await vi.advanceTimersByTimeAsync(0)
-    expect(sent).toEqual(['abc\r'])
+    await vi.advanceTimersByTimeAsync(16)
+    expect(sent).toEqual(['abc'])
 
     batcher.enqueue('d')
     await vi.advanceTimersByTimeAsync(16)
-    expect(sent).toEqual(['abc\r'])
+    batcher.enqueue('e')
+    await vi.advanceTimersByTimeAsync(16)
+    expect(sent).toEqual(['abc'])
     releaseFirst()
     await batcher.flush()
-    expect(sent).toEqual(['abc\r', 'd'])
+    expect(sent).toEqual(['abc', 'de'])
 
     batcher.dispose()
     vi.useRealTimers()
   })
 
-  it('preserves UTF-8 byte order while splitting oversized paste input', async () => {
+  it('keeps control bytes at their earliest ordered position in a coalesced successor', async () => {
+    vi.useFakeTimers()
+    const sent: string[] = []
+    let releaseFirst!: () => void
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const batcher = createExistingPaneInputBatcher(
+      async (data) => {
+        sent.push(data)
+        if (sent.length === 1) await firstBlocked
+      },
+      () => undefined,
+      16,
+    )
+
+    batcher.enqueue('first')
+    await vi.advanceTimersByTimeAsync(16)
+    batcher.enqueue('abc')
+    batcher.enqueue('\r')
+    batcher.enqueue('def')
+
+    releaseFirst()
+    await batcher.flush()
+    expect(sent).toEqual(['first', 'abc\rdef'])
+
+    batcher.dispose()
+    vi.useRealTimers()
+  })
+
+  it('preserves UTF-8 byte order and 512-byte bounds in queued successors', async () => {
     const sent: string[] = []
     const input = `${'a'.repeat(510)}é${'🙂'.repeat(130)}tail`
+    let releaseFirst!: () => void
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve })
     const batcher = createExistingPaneInputBatcher(
-      async (data) => { sent.push(data) },
+      async (data) => {
+        sent.push(data)
+        if (sent.length === 1) await firstBlocked
+      },
       () => undefined,
       0,
     )
 
+    batcher.enqueue('blocked')
+    await new Promise((resolve) => setTimeout(resolve, 0))
     batcher.enqueue(input)
+    releaseFirst()
     await batcher.flush()
 
-    expect(sent.join('')).toBe(input)
-    expect(sent.length).toBeGreaterThan(1)
+    expect(sent.slice(1).join('')).toBe(input)
+    expect(sent.length).toBeGreaterThan(2)
     expect(sent.every((chunk) => encoder.encode(chunk).byteLength <= 512)).toBe(true)
+    expect(sent.every((chunk) => !chunk.includes('\uFFFD'))).toBe(true)
     batcher.dispose()
   })
 
-  it('stops later delivery after a failed ordered batch', async () => {
+  it('drops coalesced successors after the in-flight request fails', async () => {
     vi.useFakeTimers()
     const sent: string[] = []
     const errors: unknown[] = []
     const failure = new Error('stale generation')
+    let rejectFirst!: (error: unknown) => void
+    const firstBlocked = new Promise<void>((_resolve, reject) => { rejectFirst = reject })
     const batcher = createExistingPaneInputBatcher(
       async (data) => {
         sent.push(data)
-        throw failure
+        await firstBlocked
       },
       (error) => { errors.push(error) },
       16,
@@ -130,9 +170,10 @@ describe('existing-pane browser input policy', () => {
 
     batcher.enqueue('first')
     await vi.advanceTimersByTimeAsync(16)
-    await batcher.flush()
-    batcher.enqueue('never')
+    batcher.enqueue('never-1')
     await vi.advanceTimersByTimeAsync(16)
+    batcher.enqueue('never-2')
+    rejectFirst(failure)
     await batcher.flush()
 
     expect(sent).toEqual(['first'])
