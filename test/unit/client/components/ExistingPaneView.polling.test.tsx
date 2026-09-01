@@ -88,6 +88,8 @@ describe('ExistingPaneView adaptive polling integration', () => {
         mocks.keyHandler = handler
         return { dispose: vi.fn() }
       }),
+      attachCustomKeyEventHandler: vi.fn(),
+      getSelection: vi.fn(() => ''),
       dispose: vi.fn(),
       reset: vi.fn(),
       write: mocks.terminalWrite,

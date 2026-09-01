@@ -59,6 +59,50 @@ const EXISTING_PANE_OPEN_OVERLAY_SELECTOR = [
   '[role="listbox"]',
 ].join(',')
 
+function isTerminalCopyChord(event: KeyboardEvent): boolean {
+  return !event.altKey
+    && event.key.toLowerCase() === 'c'
+    && (event.ctrlKey || event.metaKey)
+}
+
+async function copyTerminalSelection(selection: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(selection)
+      return
+    }
+  } catch {
+    // Fall back to the legacy synchronous copy path below. It remains useful
+    // when Clipboard API permissions are unavailable in a trusted key event.
+  }
+
+  const activeElement = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : undefined
+  const copyTarget = document.createElement('textarea')
+  copyTarget.value = selection
+  copyTarget.readOnly = true
+  copyTarget.tabIndex = -1
+  copyTarget.setAttribute('aria-hidden', 'true')
+  copyTarget.style.position = 'fixed'
+  copyTarget.style.opacity = '0'
+  copyTarget.style.pointerEvents = 'none'
+  document.body.append(copyTarget)
+
+  let copied = false
+  try {
+    copyTarget.select()
+    copied = typeof document.execCommand === 'function' && document.execCommand('copy')
+  } finally {
+    copyTarget.remove()
+    activeElement?.focus({ preventScroll: true })
+  }
+
+  if (!copied) {
+    throw new Error('Clipboard copy was rejected.')
+  }
+}
+
 function isMatchingActivationOwner(
   activeElement: HTMLElement,
   host: HTMLElement,
@@ -131,6 +175,7 @@ export function ExistingPaneView({
     kind: 'loading',
     message: 'Checking live tmux ownership…',
   })
+  const [copyError, setCopyError] = useState<string>()
   const [browserFocused, setBrowserFocused] = useState(() => (
     typeof document !== 'undefined'
       && document.visibilityState === 'visible'
@@ -177,6 +222,7 @@ export function ExistingPaneView({
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
+    let disposed = false
     const terminal = new Terminal({
       cursorBlink: false,
       convertEol: true,
@@ -192,11 +238,34 @@ export function ExistingPaneView({
     terminal.loadAddon(fitAddon)
     terminal.open(host)
     terminalRef.current = terminal
+    terminal.attachCustomKeyEventHandler((domEvent) => {
+      if (!domEvent.isTrusted) return true
+      const selection = terminal.getSelection()
+      if (selection.length > 0 && isTerminalCopyChord(domEvent)) {
+        // This handler runs before xterm processes the key. Consume both key
+        // phases, but copy only once on keydown.
+        domEvent.preventDefault()
+        domEvent.stopPropagation()
+        domEvent.stopImmediatePropagation()
+        if (domEvent.type === 'keydown') {
+          setCopyError(undefined)
+          void copyTerminalSelection(selection)
+            .catch(() => {
+              if (!disposed) {
+                setCopyError('Unable to copy the terminal selection. No input was sent.')
+              }
+            })
+        }
+        return false
+      }
+      return true
+    })
+
     // Deliberately do not subscribe to xterm's onData event. onData also
     // carries terminal-generated replies (focus reports, device-status
     // responses, mouse/wheel translations), which are not explicit user
-    // input. onKey is tied to a real keyboard event, while paste is captured
-    // directly from the trusted browser event below.
+    // input. Selection-copy chords are rejected by the pre-processing handler
+    // above, while onKey forwards other trusted keyboard events.
     const keySubscription = terminal.onKey(({ key, domEvent }) => {
       if (domEvent.isTrusted) inputHandlerRef.current(key)
     })
@@ -223,6 +292,7 @@ export function ExistingPaneView({
     observer.observe(host)
 
     return () => {
+      disposed = true
       observer.disconnect()
       host.removeEventListener('paste', handlePaste, true)
       keySubscription.dispose()
@@ -296,6 +366,7 @@ export function ExistingPaneView({
     inputFailedRef.current = false
     inputLeaseRef.current = undefined
     nextInputSequenceRef.current = 1
+    setCopyError(undefined)
     inputBatcherRef.current?.dispose()
     inputBatcherRef.current = createExistingPaneInputBatcher(
       async (chunk) => {
@@ -449,6 +520,16 @@ export function ExistingPaneView({
           {state.controlMode === 'shell_continuation'
             ? 'shell · Amplifier exited'
             : `tmux ${state.paneId} · input only while focused`}
+        </div>
+      )}
+
+      {copyError && (
+        <div
+          className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded border border-amber-500/40 bg-black/90 px-4 py-2 text-sm text-amber-200"
+          role="alert"
+          data-testid="existing-pane-copy-error"
+        >
+          {copyError}
         </div>
       )}
 

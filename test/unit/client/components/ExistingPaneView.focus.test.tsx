@@ -83,6 +83,8 @@ describe('ExistingPaneView automatic focus', () => {
         host.append(mocks.terminalInput)
       }),
       onKey: vi.fn(() => ({ dispose: vi.fn() })),
+      attachCustomKeyEventHandler: vi.fn(),
+      getSelection: vi.fn(() => ''),
       dispose: vi.fn(),
       focus: mocks.terminalFocus.mockImplementation(() => mocks.terminalInput?.focus()),
       reset: vi.fn(),
